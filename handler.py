@@ -16,16 +16,42 @@ from botocore.exceptions import ClientError
 APPLIO_DIR = Path("/content/Applio")
 WORK_DIR = Path("/workspace")
 
-# Always use these advanced pretrained weights (32k)
+# Always use these advanced pretrained weights (32k).
+# Default: baked into the image at /content/Applio/pretrained_custom/*.pth
 CUSTOM_PRETRAIN_DIR = APPLIO_DIR / "pretrained_custom"
 CUSTOM_PRETRAIN_G_PATH = CUSTOM_PRETRAIN_DIR / "G_15.pth"
 CUSTOM_PRETRAIN_D_PATH = CUSTOM_PRETRAIN_DIR / "D_15.pth"
 
-CUSTOM_PRETRAIN_G_URL = "https://huggingface.co/OrcunAICovers/legacy_core_pretrain_v1.5/resolve/main/G_15.pth?download=true"
-CUSTOM_PRETRAIN_D_URL = "https://huggingface.co/OrcunAICovers/legacy_core_pretrain_v1.5/resolve/main/D_15.pth?download=true"
+# URLs are overridable via env vars for painless upgrades.
+CUSTOM_PRETRAIN_G_URL = os.environ.get(
+    "CUSTOM_PRETRAIN_G_URL",
+    "https://huggingface.co/OrcunAICovers/legacy_core_pretrain_v1.5/resolve/main/G_15.pth?download=true",
+)
+CUSTOM_PRETRAIN_D_URL = os.environ.get(
+    "CUSTOM_PRETRAIN_D_URL",
+    "https://huggingface.co/OrcunAICovers/legacy_core_pretrain_v1.5/resolve/main/D_15.pth?download=true",
+)
 
-FORCED_SR_TAG = "32k"
-FORCED_SR = 32000
+# Advanced pretrains are 32k; we force sample rate to match for consistency.
+FORCED_SR_TAG = os.environ.get("FORCED_SR_TAG", "32k")
+FORCED_SR = int(os.environ.get("FORCED_SR", "32000"))
+
+# Opinionated defaults for training initialization.
+# These align with the desired baseline settings and reduce variability.
+FORCE_VOCODER = "HiFi-GAN"
+FORCE_CUT_PREPROCESS = "Automatic"
+FORCE_NORMALIZATION_MODE = "post"
+FORCE_F0_METHOD = "rmvpe"
+FORCE_EMBEDDER_MODEL = "contentvec"
+FORCE_INCLUDE_MUTES = 2
+FORCE_BATCH_SIZE = 4
+FORCE_INDEX_ALGORITHM = "Auto"
+
+# Noise settings:
+# - "noise filter": on (if Applio supports a flag for it)
+# - noise reduction: off
+FORCE_NOISE_FILTER = True
+FORCE_NOISE_REDUCTION = False
 
 
 def require_env(name: str) -> str:
@@ -159,9 +185,9 @@ def download_file_http(url: str, dest: Path, retries: int = 3, timeout_sec: int 
 def ensure_custom_pretrained():
     # Always ensure advanced pretrained exists; fail job if can't fetch.
     missing = []
-    if not CUSTOM_PRETRAIN_G_PATH.exists():
+    if not CUSTOM_PRETRAIN_G_PATH.exists() or CUSTOM_PRETRAIN_G_PATH.stat().st_size < 5_000_000:
         missing.append("G")
-    if not CUSTOM_PRETRAIN_D_PATH.exists():
+    if not CUSTOM_PRETRAIN_D_PATH.exists() or CUSTOM_PRETRAIN_D_PATH.stat().st_size < 5_000_000:
         missing.append("D")
 
     if not missing:
@@ -184,6 +210,37 @@ def ensure_custom_pretrained():
 
     if not CUSTOM_PRETRAIN_G_PATH.exists() or not CUSTOM_PRETRAIN_D_PATH.exists():
         raise RuntimeError("Custom pretrained download failed; required files are missing.")
+
+
+def validate_forced_sample_rate():
+    if FORCED_SR_TAG not in ("32k", "40k", "48k"):
+        raise RuntimeError(f"Invalid FORCED_SR_TAG: {FORCED_SR_TAG}. Use 32k/40k/48k")
+    if FORCED_SR not in (32000, 40000, 48000):
+        raise RuntimeError(f"Invalid FORCED_SR: {FORCED_SR}. Use 32000/40000/48000")
+    expected = int(FORCED_SR_TAG.rstrip("k")) * 1000
+    if expected != FORCED_SR:
+        raise RuntimeError(f"FORCED_SR_TAG and FORCED_SR mismatch: {FORCED_SR_TAG} vs {FORCED_SR}")
+
+
+_HELP_CACHE = {}
+
+
+def get_core_help(subcommand: str) -> str:
+    # Cache help output to avoid rerunning for every job.
+    cached = _HELP_CACHE.get(subcommand)
+    if cached is not None:
+        return cached
+    try:
+        out = run(["python", "core.py", subcommand, "--help"], cwd=str(APPLIO_DIR))
+    except Exception:
+        out = ""
+    _HELP_CACHE[subcommand] = out or ""
+    return _HELP_CACHE[subcommand]
+
+
+def core_supports_flag(subcommand: str, flag: str) -> bool:
+    # Simple substring check is enough for argparse help.
+    return flag in get_core_help(subcommand)
 
 
 def probe_audio(path: Path):
@@ -241,6 +298,7 @@ def export_inference_zip(model_name: str, out_zip: Path):
 
 def handler(job):
     ensure_applio()
+    validate_forced_sample_rate()
 
     bucket = require_env("R2_BUCKET")
     inp = (job or {}).get("input") or {}
@@ -255,33 +313,38 @@ def handler(job):
 
     model_name = inp.get("modelName")
 
-    # Force sample rate to 32k (advanced pretrains are 32k)
+    # Force sample rate (advanced pretrains are trained for this SR)
     requested_sr = inp.get("sampleRate")
     sr_tag = FORCED_SR_TAG
     sr = FORCED_SR
-    if requested_sr and str(requested_sr).strip().lower() not in ("32k", "32000"):
+    if requested_sr and str(requested_sr).strip().lower() not in (sr_tag, str(sr)):
         print(json.dumps({"event": "sample_rate_forced", "requested": requested_sr, "using": sr_tag}))
 
-    # Defaults
-    cut_preprocess = inp.get("cutPreprocess", "Automatic")
+    # Initialize requested baseline settings (force to reduce variance)
+    cut_preprocess = FORCE_CUT_PREPROCESS
     chunk_len = as_float(inp.get("chunkLen"), 3.0)
     overlap_len = as_float(inp.get("overlapLen"), 0.3)
-    normalization_mode = inp.get("normalizationMode", "post")
+    normalization_mode = FORCE_NORMALIZATION_MODE
 
-    f0_method = inp.get("f0Method", "rmvpe")
-    include_mutes = as_int(inp.get("includeMutes"), 2)
-    embedder_model = inp.get("embedderModel", "contentvec")
-    index_algorithm = inp.get("indexAlgorithm", "Auto")
+    f0_method = FORCE_F0_METHOD
+    include_mutes = FORCE_INCLUDE_MUTES
+    embedder_model = FORCE_EMBEDDER_MODEL
+    index_algorithm = FORCE_INDEX_ALGORITHM
 
-    total_epoch = as_int(inp.get("totalEpoch"), 200)
-    batch_size = as_int(inp.get("batchSize"), 4)
+    # Test mode: default 1 epoch unless explicitly overridden.
+    total_epoch = as_int(inp.get("totalEpoch"), 1)
+    if total_epoch < 1:
+        total_epoch = 1
+
+    batch_size = as_int(inp.get("batchSize"), FORCE_BATCH_SIZE)
+    batch_size = FORCE_BATCH_SIZE
 
     save_every_epoch = as_int(inp.get("saveEveryEpoch"), 10)
     save_only_latest = as_bool(inp.get("saveOnlyLatest"), True)
 
-    vocoder = inp.get("vocoder", "HiFi-GAN")
+    vocoder = FORCE_VOCODER
 
-    # Always use custom advanced pretrained
+    # Always use custom advanced pretrained (ignore Applio defaults)
     pretrained = True
     custom_pretrained = True
 
@@ -300,6 +363,13 @@ def handler(job):
                 "sr": sr,
                 "totalEpoch": total_epoch,
                 "batchSize": batch_size,
+                "vocoder": vocoder,
+                "cutPreprocess": cut_preprocess,
+                "normalizationMode": normalization_mode,
+                "f0Method": f0_method,
+                "embedderModel": embedder_model,
+                "includeMutes": include_mutes,
+                "indexAlgorithm": index_algorithm,
                 "pretrained": pretrained,
                 "customPretrained": custom_pretrained,
                 "saveOnlyLatest": save_only_latest,
@@ -350,36 +420,47 @@ def handler(job):
     cpu_cores = os.cpu_count() or 2
 
     print(json.dumps({"event": "preprocess_start"}))
-    run(
-        [
-            "python",
-            "core.py",
-            "preprocess",
-            "--model_name",
-            model_name,
-            "--dataset_path",
-            str(dataset_dir),
-            "--sample_rate",
-            str(sr),
-            "--cpu_cores",
-            str(cpu_cores),
-            "--cut_preprocess",
-            str(cut_preprocess),
-            "--chunk_len",
-            str(chunk_len),
-            "--overlap_len",
-            str(overlap_len),
-            "--normalization_mode",
-            str(normalization_mode),
-            "--process_effects",
-            "False",
-            "--noise_reduction",
-            "False",
-            "--noise_reduction_strength",
-            "0.7",
-        ],
-        cwd=str(APPLIO_DIR),
-    )
+
+    preprocess_cmd = [
+        "python",
+        "core.py",
+        "preprocess",
+        "--model_name",
+        model_name,
+        "--dataset_path",
+        str(dataset_dir),
+        "--sample_rate",
+        str(sr),
+        "--cpu_cores",
+        str(cpu_cores),
+        "--cut_preprocess",
+        str(cut_preprocess),
+        "--chunk_len",
+        str(chunk_len),
+        "--overlap_len",
+        str(overlap_len),
+        "--normalization_mode",
+        str(normalization_mode),
+    ]
+
+    # Noise flags are version-dependent; only pass if supported by this Applio build.
+    noise_flags = []
+    if core_supports_flag("preprocess", "--noise_filter"):
+        preprocess_cmd += ["--noise_filter", str(FORCE_NOISE_FILTER)]
+        noise_flags.append("noise_filter")
+    elif core_supports_flag("preprocess", "--noise_filtering"):
+        preprocess_cmd += ["--noise_filtering", str(FORCE_NOISE_FILTER)]
+        noise_flags.append("noise_filtering")
+    if core_supports_flag("preprocess", "--noise_reduction"):
+        preprocess_cmd += ["--noise_reduction", str(FORCE_NOISE_REDUCTION)]
+        noise_flags.append("noise_reduction")
+    if core_supports_flag("preprocess", "--noise_reduction_strength"):
+        # Keep a reasonable default even though noise reduction is off.
+        preprocess_cmd += ["--noise_reduction_strength", "0.7"]
+        noise_flags.append("noise_reduction_strength")
+
+    print(json.dumps({"event": "preprocess_flags", "noiseFlags": noise_flags}))
+    run(preprocess_cmd, cwd=str(APPLIO_DIR))
     print(json.dumps({"event": "preprocess_done"}))
 
     print(json.dumps({"event": "extract_start"}))
@@ -425,6 +506,7 @@ def handler(job):
     print(json.dumps({"event": "index_done"}))
 
     print(json.dumps({"event": "train_start"}))
+    # Keep train flags minimal; unspecified settings follow Applio defaults.
     train_cmd = [
         "python",
         "core.py",
@@ -435,8 +517,6 @@ def handler(job):
         str(save_every_epoch),
         "--save_only_latest",
         str(save_only_latest),
-        "--save_every_weights",
-        "False",
         "--total_epoch",
         str(total_epoch),
         "--sample_rate",
@@ -453,18 +533,8 @@ def handler(job):
         str(CUSTOM_PRETRAIN_G_PATH),
         "--d_pretrained_path",
         str(CUSTOM_PRETRAIN_D_PATH),
-        "--overtraining_detector",
-        "False",
-        "--overtraining_threshold",
-        "50",
-        "--cleanup",
-        "False",
-        "--cache_data_in_gpu",
-        "False",
         "--vocoder",
         vocoder,
-        "--checkpointing",
-        "False",
     ]
     run(train_cmd, cwd=str(APPLIO_DIR))
     print(json.dumps({"event": "train_done"}))
