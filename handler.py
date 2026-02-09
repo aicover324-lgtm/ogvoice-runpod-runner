@@ -47,6 +47,10 @@ FORCE_INCLUDE_MUTES = 2
 FORCE_BATCH_SIZE = 4
 FORCE_INDEX_ALGORITHM = "Auto"
 
+# "Noise filter" in Applio UI maps to the preprocess flag `--process_effects`.
+# This applies a simple filter during preprocessing.
+FORCE_PROCESS_EFFECTS = True
+
 # Noise settings:
 # - "noise filter": on (if Applio supports a flag for it)
 # - noise reduction: off
@@ -362,6 +366,7 @@ def handler(job):
                 "batchSize": batch_size,
                 "vocoder": vocoder,
                 "cutPreprocess": cut_preprocess,
+                "processEffects": FORCE_PROCESS_EFFECTS,
                 "normalizationMode": normalization_mode,
                 "f0Method": f0_method,
                 "embedderModel": embedder_model,
@@ -444,23 +449,25 @@ def handler(job):
         str(normalization_mode),
     ]
 
-    # Noise flags are version-dependent; only pass if supported by this Applio build.
-    noise_flags = []
-    if core_supports_flag("preprocess", "--noise_filter"):
-        preprocess_cmd += ["--noise_filter", str(FORCE_NOISE_FILTER)]
-        noise_flags.append("noise_filter")
-    elif core_supports_flag("preprocess", "--noise_filtering"):
-        preprocess_cmd += ["--noise_filtering", str(FORCE_NOISE_FILTER)]
-        noise_flags.append("noise_filtering")
+    # Preprocess flags are version-dependent; only pass if supported by this Applio build.
+    preprocess_flags = []
+
+    # Applio UI: "Noise filter" == process_effects
+    if core_supports_flag("preprocess", "--process_effects"):
+        preprocess_cmd += ["--process_effects", str(FORCE_PROCESS_EFFECTS)]
+        preprocess_flags.append("process_effects")
+    else:
+        print(json.dumps({"event": "preprocess_warn", "missingFlag": "--process_effects"}))
 
     if core_supports_flag("preprocess", "--noise_reduction"):
         preprocess_cmd += ["--noise_reduction", str(FORCE_NOISE_REDUCTION)]
-        noise_flags.append("noise_reduction")
+        preprocess_flags.append("noise_reduction")
     if core_supports_flag("preprocess", "--noise_reduction_strength"):
+        # Keep a reasonable default even though noise reduction is off.
         preprocess_cmd += ["--noise_reduction_strength", "0.7"]
-        noise_flags.append("noise_reduction_strength")
+        preprocess_flags.append("noise_reduction_strength")
 
-    print(json.dumps({"event": "preprocess_flags", "noiseFlags": noise_flags}))
+    print(json.dumps({"event": "preprocess_flags", "flags": preprocess_flags}))
     run(preprocess_cmd, cwd=str(APPLIO_DIR))
     print(json.dumps({"event": "preprocess_done"}))
 
