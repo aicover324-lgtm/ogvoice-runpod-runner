@@ -226,7 +226,6 @@ _HELP_CACHE = {}
 
 
 def get_core_help(subcommand: str) -> str:
-    # Cache help output to avoid rerunning for every job.
     cached = _HELP_CACHE.get(subcommand)
     if cached is not None:
         return cached
@@ -239,7 +238,6 @@ def get_core_help(subcommand: str) -> str:
 
 
 def core_supports_flag(subcommand: str, flag: str) -> bool:
-    # Simple substring check is enough for argparse help.
     return flag in get_core_help(subcommand)
 
 
@@ -336,7 +334,6 @@ def handler(job):
     if total_epoch < 1:
         total_epoch = 1
 
-    batch_size = as_int(inp.get("batchSize"), FORCE_BATCH_SIZE)
     batch_size = FORCE_BATCH_SIZE
 
     save_every_epoch = as_int(inp.get("saveEveryEpoch"), 10)
@@ -417,10 +414,14 @@ def handler(job):
     )
     print(json.dumps({"event": "applio_prerequisites_done"}))
 
-    cpu_cores = os.cpu_count() or 2
+    # Applio's CLI limits cpu_cores to a fixed range (commonly max 64).
+    # Some RunPod machines report higher counts (e.g. 128), which would crash.
+    cpu_cores_raw = os.cpu_count() or 2
+    cpu_cores = max(1, min(int(cpu_cores_raw), 64))
+    if cpu_cores != cpu_cores_raw:
+        print(json.dumps({"event": "cpu_cores_clamped", "raw": cpu_cores_raw, "using": cpu_cores}))
 
     print(json.dumps({"event": "preprocess_start"}))
-
     preprocess_cmd = [
         "python",
         "core.py",
@@ -451,11 +452,11 @@ def handler(job):
     elif core_supports_flag("preprocess", "--noise_filtering"):
         preprocess_cmd += ["--noise_filtering", str(FORCE_NOISE_FILTER)]
         noise_flags.append("noise_filtering")
+
     if core_supports_flag("preprocess", "--noise_reduction"):
         preprocess_cmd += ["--noise_reduction", str(FORCE_NOISE_REDUCTION)]
         noise_flags.append("noise_reduction")
     if core_supports_flag("preprocess", "--noise_reduction_strength"):
-        # Keep a reasonable default even though noise reduction is off.
         preprocess_cmd += ["--noise_reduction_strength", "0.7"]
         noise_flags.append("noise_reduction_strength")
 
