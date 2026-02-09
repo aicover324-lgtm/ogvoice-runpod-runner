@@ -1,4 +1,4 @@
-FROM pytorch/pytorch:2.4.0-cuda12.1-cudnn9-runtime
+FROM pytorch/pytorch:2.7.1-cuda12.8-cudnn9-runtime
 
 ENV DEBIAN_FRONTEND=noninteractive
 WORKDIR /app
@@ -12,14 +12,16 @@ RUN mkdir -p /content \
   && cd /content \
   && git clone https://github.com/IAHispano/Applio --branch 3.6.0 --single-branch
 
-RUN pip install --no-cache-dir -r /content/Applio/requirements.txt
+# IMPORTANT: install with PyTorch cu128 index so torch==2.7.1+cu128 is found
+RUN pip install --upgrade pip \
+  && pip install --no-cache-dir -r /content/Applio/requirements.txt \
+     --extra-index-url https://download.pytorch.org/whl/cu128
 
 # Our runner deps
 COPY requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r /app/requirements.txt
 
 COPY handler.py /app/handler.py
-
 RUN mkdir -p /workspace
 
 CMD ["python", "-u", "/app/handler.py"]
