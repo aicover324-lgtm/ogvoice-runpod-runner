@@ -3,7 +3,9 @@ import json
 import shutil
 import subprocess
 import zipfile
+import time
 from pathlib import Path
+from urllib.request import Request, urlopen
 
 import boto3
 import runpod
@@ -13,6 +15,17 @@ from botocore.exceptions import ClientError
 
 APPLIO_DIR = Path("/content/Applio")
 WORK_DIR = Path("/workspace")
+
+# Always use these advanced pretrained weights (32k)
+CUSTOM_PRETRAIN_DIR = APPLIO_DIR / "pretrained_custom"
+CUSTOM_PRETRAIN_G_PATH = CUSTOM_PRETRAIN_DIR / "G_15.pth"
+CUSTOM_PRETRAIN_D_PATH = CUSTOM_PRETRAIN_DIR / "D_15.pth"
+
+CUSTOM_PRETRAIN_G_URL = "https://huggingface.co/OrcunAICovers/legacy_core_pretrain_v1.5/resolve/main/G_15.pth?download=true"
+CUSTOM_PRETRAIN_D_URL = "https://huggingface.co/OrcunAICovers/legacy_core_pretrain_v1.5/resolve/main/D_15.pth?download=true"
+
+FORCED_SR_TAG = "32k"
+FORCED_SR = 32000
 
 
 def require_env(name: str) -> str:
@@ -62,39 +75,6 @@ def as_float(v, default: float) -> float:
     return default
 
 
-def parse_sample_rate(v, default_tag="40k"):
-    """
-    Accepts: "32k"/"40k"/"48k", 32000/40000/48000, "40000"
-    Returns: (sr_int, tag_str like "40k")
-    """
-    if v is None:
-        tag = default_tag
-    elif isinstance(v, (int, float)):
-        sr = int(v)
-        if sr in (32000, 40000, 48000):
-            tag = f"{sr // 1000}k"
-        else:
-            raise RuntimeError(f"Invalid sampleRate: {v}. Use 32000/40000/48000 or '32k'/'40k'/'48k'.")
-    elif isinstance(v, str):
-        s = v.strip().lower()
-        if s.endswith("k"):
-            n = s[:-1].strip()
-            if n not in ("32", "40", "48"):
-                raise RuntimeError(f"Invalid sampleRate: {v}. Use '32k'/'40k'/'48k'.")
-            tag = f"{n}k"
-        else:
-            # "40000"
-            sr = int(float(s))
-            if sr not in (32000, 40000, 48000):
-                raise RuntimeError(f"Invalid sampleRate: {v}. Use 32000/40000/48000 or '32k'/'40k'/'48k'.")
-            tag = f"{sr // 1000}k"
-    else:
-        tag = default_tag
-
-    sr = int(tag.rstrip("k")) * 1000
-    return sr, tag
-
-
 def s3():
     endpoint = require_env("R2_ENDPOINT").rstrip("/")
     access_key = require_env("R2_ACCESS_KEY_ID")
@@ -135,20 +115,81 @@ def ensure_applio():
         raise RuntimeError(f"Applio core.py not found: {core}")
 
 
+def download_file_http(url: str, dest: Path, retries: int = 3, timeout_sec: int = 120):
+    dest.parent.mkdir(parents=True, exist_ok=True)
+
+    tmp = dest.with_suffix(dest.suffix + ".tmp")
+    if tmp.exists():
+        tmp.unlink()
+
+    last_err = None
+    for i in range(retries):
+        try:
+            req = Request(url, headers={"User-Agent": "ogvoice-runpod-runner/1.0"})
+            with urlopen(req, timeout=timeout_sec) as r:
+                if getattr(r, "status", 200) >= 400:
+                    raise RuntimeError(f"HTTP {getattr(r, 'status', '???')} while downloading {url}")
+
+                with open(tmp, "wb") as f:
+                    while True:
+                        chunk = r.read(1024 * 1024)
+                        if not chunk:
+                            break
+                        f.write(chunk)
+
+            if not tmp.exists() or tmp.stat().st_size < 5_000_000:
+                raise RuntimeError(f"Downloaded file too small: {tmp.stat().st_size if tmp.exists() else 0} bytes")
+
+            if dest.exists():
+                dest.unlink()
+            tmp.replace(dest)
+            return
+        except Exception as e:
+            last_err = e
+            try:
+                if tmp.exists():
+                    tmp.unlink()
+            except Exception:
+                pass
+            time.sleep(2 * (i + 1))
+
+    raise RuntimeError(f"Failed to download after {retries} attempts: {url}\n{last_err}") from last_err
+
+
+def ensure_custom_pretrained():
+    # Always ensure advanced pretrained exists; fail job if can't fetch.
+    missing = []
+    if not CUSTOM_PRETRAIN_G_PATH.exists():
+        missing.append("G")
+    if not CUSTOM_PRETRAIN_D_PATH.exists():
+        missing.append("D")
+
+    if not missing:
+        return
+
+    print(json.dumps({"event": "custom_pretrained_download_start", "missing": missing}))
+    if "G" in missing:
+        download_file_http(CUSTOM_PRETRAIN_G_URL, CUSTOM_PRETRAIN_G_PATH)
+    if "D" in missing:
+        download_file_http(CUSTOM_PRETRAIN_D_URL, CUSTOM_PRETRAIN_D_PATH)
+    print(
+        json.dumps(
+            {
+                "event": "custom_pretrained_download_done",
+                "gBytes": CUSTOM_PRETRAIN_G_PATH.stat().st_size if CUSTOM_PRETRAIN_G_PATH.exists() else None,
+                "dBytes": CUSTOM_PRETRAIN_D_PATH.stat().st_size if CUSTOM_PRETRAIN_D_PATH.exists() else None,
+            }
+        )
+    )
+
+    if not CUSTOM_PRETRAIN_G_PATH.exists() or not CUSTOM_PRETRAIN_D_PATH.exists():
+        raise RuntimeError("Custom pretrained download failed; required files are missing.")
+
+
 def probe_audio(path: Path):
-    # Optional sanity check. If ffprobe doesn't exist, we skip.
     try:
         out = run(
-            [
-                "ffprobe",
-                "-v",
-                "error",
-                "-show_entries",
-                "format=duration",
-                "-of",
-                "json",
-                str(path),
-            ]
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "json", str(path)]
         )
         data = json.loads(out)
         duration = float(((data.get("format") or {}).get("duration")) or 0)
@@ -158,8 +199,7 @@ def probe_audio(path: Path):
     except FileNotFoundError:
         print("ffprobe not found; skipping audio probe.")
         return {"durationSec": None}
-    except json.JSONDecodeError:
-        print("ffprobe returned non-JSON; skipping audio probe.")
+    except Exception:
         return {"durationSec": None}
 
 
@@ -205,7 +245,6 @@ def handler(job):
     bucket = require_env("R2_BUCKET")
     inp = (job or {}).get("input") or {}
 
-    # Required keys (clear errors)
     if "datasetKey" not in inp:
         raise RuntimeError("Missing required input: datasetKey")
     if "outKey" not in inp:
@@ -215,9 +254,15 @@ def handler(job):
     out_key = inp["outKey"]
 
     model_name = inp.get("modelName")
-    sr, sr_tag = parse_sample_rate(inp.get("sampleRate"), default_tag="40k")
 
-    # UI defaults’e yakin:
+    # Force sample rate to 32k (advanced pretrains are 32k)
+    requested_sr = inp.get("sampleRate")
+    sr_tag = FORCED_SR_TAG
+    sr = FORCED_SR
+    if requested_sr and str(requested_sr).strip().lower() not in ("32k", "32000"):
+        print(json.dumps({"event": "sample_rate_forced", "requested": requested_sr, "using": sr_tag}))
+
+    # Defaults
     cut_preprocess = inp.get("cutPreprocess", "Automatic")
     chunk_len = as_float(inp.get("chunkLen"), 3.0)
     overlap_len = as_float(inp.get("overlapLen"), 0.3)
@@ -231,11 +276,14 @@ def handler(job):
     total_epoch = as_int(inp.get("totalEpoch"), 200)
     batch_size = as_int(inp.get("batchSize"), 4)
 
-    pretrained = as_bool(inp.get("pretrained"), True)
     save_every_epoch = as_int(inp.get("saveEveryEpoch"), 10)
     save_only_latest = as_bool(inp.get("saveOnlyLatest"), True)
 
     vocoder = inp.get("vocoder", "HiFi-GAN")
+
+    # Always use custom advanced pretrained
+    pretrained = True
+    custom_pretrained = True
 
     if not model_name:
         req_id = (job or {}).get("id", "job")
@@ -253,7 +301,20 @@ def handler(job):
                 "totalEpoch": total_epoch,
                 "batchSize": batch_size,
                 "pretrained": pretrained,
+                "customPretrained": custom_pretrained,
                 "saveOnlyLatest": save_only_latest,
+            }
+        )
+    )
+
+    # Ensure advanced pretrained exists (download if missing)
+    ensure_custom_pretrained()
+    print(
+        json.dumps(
+            {
+                "event": "custom_pretrained_selected",
+                "g": str(CUSTOM_PRETRAIN_G_PATH),
+                "d": str(CUSTOM_PRETRAIN_D_PATH),
             }
         )
     )
@@ -276,7 +337,6 @@ def handler(job):
     except ClientError as e:
         raise RuntimeError(f"Failed to download from R2: s3://{bucket}/{dataset_key}\n{e}") from e
 
-    # Optional sanity check
     audio_info = probe_audio(dataset_path)
     print(json.dumps({"event": "audio_probe", **audio_info}))
 
@@ -364,82 +424,49 @@ def handler(job):
     )
     print(json.dumps({"event": "index_done"}))
 
-    # Choose pretrained paths by sample rate tag; fallback to 48k if missing
-    pretrained_root = APPLIO_DIR / "rvc/models/pretraineds/pretraineds_custom"
-    g_pre = pretrained_root / f"G{sr_tag}.pth"
-    d_pre = pretrained_root / f"D{sr_tag}.pth"
-
-    if not g_pre.exists() or not d_pre.exists():
-        g48 = pretrained_root / "G48k.pth"
-        d48 = pretrained_root / "D48k.pth"
-        if g48.exists() and d48.exists():
-            print(
-                json.dumps(
-                    {
-                        "event": "pretrained_fallback",
-                        "reason": "missing_sr_specific_pretrained",
-                        "wanted": {"g": str(g_pre), "d": str(d_pre)},
-                        "using": {"g": str(g48), "d": str(d48)},
-                    }
-                )
-            )
-            g_pre, d_pre = g48, d48
-        else:
-            print(
-                json.dumps(
-                    {
-                        "event": "pretrained_missing",
-                        "reason": "no_pretrained_files_found",
-                        "wanted": {"g": str(g_pre), "d": str(d_pre)},
-                    }
-                )
-            )
-
     print(json.dumps({"event": "train_start"}))
-    run(
-        [
-            "python",
-            "core.py",
-            "train",
-            "--model_name",
-            model_name,
-            "--save_every_epoch",
-            str(save_every_epoch),
-            "--save_only_latest",
-            str(save_only_latest),
-            "--save_every_weights",
-            "False",
-            "--total_epoch",
-            str(total_epoch),
-            "--sample_rate",
-            str(sr),
-            "--batch_size",
-            str(batch_size),
-            "--gpu",
-            "0",
-            "--pretrained",
-            str(pretrained),
-            "--custom_pretrained",
-            "False",
-            "--g_pretrained_path",
-            str(g_pre),
-            "--d_pretrained_path",
-            str(d_pre),
-            "--overtraining_detector",
-            "False",
-            "--overtraining_threshold",
-            "50",
-            "--cleanup",
-            "False",
-            "--cache_data_in_gpu",
-            "False",
-            "--vocoder",
-            vocoder,
-            "--checkpointing",
-            "False",
-        ],
-        cwd=str(APPLIO_DIR),
-    )
+    train_cmd = [
+        "python",
+        "core.py",
+        "train",
+        "--model_name",
+        model_name,
+        "--save_every_epoch",
+        str(save_every_epoch),
+        "--save_only_latest",
+        str(save_only_latest),
+        "--save_every_weights",
+        "False",
+        "--total_epoch",
+        str(total_epoch),
+        "--sample_rate",
+        str(sr),
+        "--batch_size",
+        str(batch_size),
+        "--gpu",
+        "0",
+        "--pretrained",
+        str(pretrained),
+        "--custom_pretrained",
+        str(custom_pretrained),
+        "--g_pretrained_path",
+        str(CUSTOM_PRETRAIN_G_PATH),
+        "--d_pretrained_path",
+        str(CUSTOM_PRETRAIN_D_PATH),
+        "--overtraining_detector",
+        "False",
+        "--overtraining_threshold",
+        "50",
+        "--cleanup",
+        "False",
+        "--cache_data_in_gpu",
+        "False",
+        "--vocoder",
+        vocoder,
+        "--checkpointing",
+        "False",
+    ]
+    run(train_cmd, cwd=str(APPLIO_DIR))
     print(json.dumps({"event": "train_done"}))
 
     out_zip = job_dir / "model.zip"
@@ -461,6 +488,10 @@ def handler(job):
         "sampleRate": sr_tag,
         "sr": sr,
         "audio": audio_info,
+        "pretrained": {
+            "g": str(CUSTOM_PRETRAIN_G_PATH),
+            "d": str(CUSTOM_PRETRAIN_D_PATH),
+        },
     }
 
 
