@@ -1,6 +1,6 @@
 import os
-import json
 import boto3
+import runpod
 from botocore.config import Config
 
 
@@ -9,7 +9,6 @@ def _s3():
     access_key = os.environ["R2_ACCESS_KEY_ID"]
     secret_key = os.environ["R2_SECRET_ACCESS_KEY"]
 
-    # R2 için path-style genelde sorunsuz
     return boto3.client(
         "s3",
         endpoint_url=endpoint,
@@ -20,15 +19,9 @@ def _s3():
     )
 
 
-def handler(event):
-    """
-    RunPod serverless handler.
-    event["input"] içinden payload gelir.
-    """
+def handler(job):
     bucket = os.environ["R2_BUCKET"]
-    inp = (event or {}).get("input") or {}
-
-    # Basit test input: datasetKey ver (opsiyonel)
+    inp = (job or {}).get("input") or {}
     dataset_key = inp.get("datasetKey")
 
     s3 = _s3()
@@ -50,3 +43,7 @@ def handler(event):
             out["exists"] = False
 
     return out
+
+
+if __name__ == "__main__":
+    runpod.serverless.start({"handler": handler})
