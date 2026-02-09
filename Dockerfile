@@ -29,6 +29,78 @@ RUN pip install --no-cache-dir -r /app/requirements.txt
 
 COPY handler.py /app/handler.py
 
+# Download advanced pretrained weights at build time.
+# This removes runtime dependency on HuggingFace/network and ensures training
+# always uses these pretrains.
+RUN python - <<'PY'
+import os
+import time
+from pathlib import Path
+from urllib.request import Request, urlopen
+
+G_URL = os.environ.get(
+    "CUSTOM_PRETRAIN_G_URL",
+    "https://huggingface.co/OrcunAICovers/legacy_core_pretrain_v1.5/resolve/main/G_15.pth?download=true",
+)
+D_URL = os.environ.get(
+    "CUSTOM_PRETRAIN_D_URL",
+    "https://huggingface.co/OrcunAICovers/legacy_core_pretrain_v1.5/resolve/main/D_15.pth?download=true",
+)
+
+dest_dir = Path("/content/Applio/pretrained_custom")
+dest_dir.mkdir(parents=True, exist_ok=True)
+
+targets = [
+    (G_URL, dest_dir / "G_15.pth"),
+    (D_URL, dest_dir / "D_15.pth"),
+]
+
+def download(url: str, dest: Path, retries: int = 3, timeout_sec: int = 120):
+    tmp = dest.with_suffix(dest.suffix + ".tmp")
+    if tmp.exists():
+        tmp.unlink()
+
+    last_err = None
+    for i in range(retries):
+        try:
+            req = Request(url, headers={"User-Agent": "ogvoice-runpod-runner-build/1.0"})
+            with urlopen(req, timeout=timeout_sec) as r:
+                status = getattr(r, "status", 200)
+                if status >= 400:
+                    raise RuntimeError(f"HTTP {status} while downloading {url}")
+                with open(tmp, "wb") as f:
+                    while True:
+                        chunk = r.read(1024 * 1024)
+                        if not chunk:
+                            break
+                        f.write(chunk)
+
+            if not tmp.exists() or tmp.stat().st_size < 5_000_000:
+                raise RuntimeError(f"Downloaded file too small: {tmp.stat().st_size if tmp.exists() else 0} bytes")
+
+            if dest.exists():
+                dest.unlink()
+            tmp.replace(dest)
+            return
+        except Exception as e:
+            last_err = e
+            try:
+                if tmp.exists():
+                    tmp.unlink()
+            except Exception:
+                pass
+            time.sleep(2 * (i + 1))
+
+    raise RuntimeError(f"Failed to download after {retries} attempts: {url}\n{last_err}")
+
+
+for url, dest in targets:
+    print(f"Downloading: {url} -> {dest}")
+    download(url, dest)
+    print(f"OK: {dest} ({dest.stat().st_size} bytes)")
+
+PY
+
 # Work dir for jobs
 RUN mkdir -p /workspace
 
