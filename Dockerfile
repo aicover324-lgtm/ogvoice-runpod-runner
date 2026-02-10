@@ -25,8 +25,10 @@ RUN pip install --upgrade pip \
 
 # Preload Applio prerequisites at build time to avoid runtime downloads.
 # This reduces cold-start time and avoids wasting paid worker runtime.
-# NOTE: WORKDIR is /app, so we must run core.py from /content/Applio.
-RUN python -u /content/Applio/core.py prerequisites --models True --pretraineds_hifigan True --exe False \
+# NOTE: Applio core.py expects to run with CWD=/content/Applio because it reads
+# files like rvc/lib/tools/tts_voices.json using relative paths.
+RUN cd /content/Applio \
+  && python -u core.py prerequisites --models True --pretraineds_hifigan True --exe False \
   && python - <<'PY'
 from pathlib import Path
 p = Path('/content/Applio/.prerequisites_ready')
