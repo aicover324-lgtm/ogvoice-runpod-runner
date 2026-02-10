@@ -25,7 +25,8 @@ RUN pip install --upgrade pip \
 
 # Preload Applio prerequisites at build time to avoid runtime downloads.
 # This reduces cold-start time and avoids wasting paid worker runtime.
-RUN python -u core.py prerequisites --models True --pretraineds_hifigan True --exe False \
+# NOTE: WORKDIR is /app, so we must run core.py from /content/Applio.
+RUN python -u /content/Applio/core.py prerequisites --models True --pretraineds_hifigan True --exe False \
   && python - <<'PY'
 from pathlib import Path
 p = Path('/content/Applio/.prerequisites_ready')
