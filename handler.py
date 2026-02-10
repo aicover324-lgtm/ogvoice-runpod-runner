@@ -318,6 +318,31 @@ def probe_audio(path: Path):
         return {"durationSec": None}
 
 
+def ffmpeg_convert_to_flac(src_wav: Path, dest_flac: Path):
+    dest_flac.parent.mkdir(parents=True, exist_ok=True)
+    if dest_flac.exists():
+        dest_flac.unlink()
+    # Lossless compression; keep original sample rate/channels.
+    run(
+        [
+            "ffmpeg",
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-i",
+            str(src_wav),
+            "-c:a",
+            "flac",
+            "-compression_level",
+            "8",
+            str(dest_flac),
+        ]
+    )
+    if not dest_flac.exists() or dest_flac.stat().st_size == 0:
+        raise RuntimeError("FLAC conversion failed (empty output)")
+
+
 def export_inference_zip(model_name: str, out_zip: Path):
     logs_dir = APPLIO_DIR / "logs" / model_name
     if not logs_dir.exists():
@@ -368,6 +393,7 @@ def handler(job):
 
     dataset_key = inp["datasetKey"]
     out_key = inp["outKey"]
+    dataset_archive_key = inp.get("datasetArchiveKey")
 
     model_name = inp.get("modelName")
 
@@ -464,21 +490,70 @@ def handler(job):
     dataset_dir = job_dir / "dataset"
     dataset_dir.mkdir(parents=True, exist_ok=True)
     dataset_path = dataset_dir / "dataset.wav"
+    dataset_flac_path = dataset_dir / "dataset.flac"
 
     client = s3()
 
-    # Download dataset.wav from R2
+    # Download dataset from R2
     try:
         print(json.dumps({"event": "download_start", "bucket": bucket, "key": dataset_key}))
-        client.download_file(bucket, dataset_key, str(dataset_path))
-        if not dataset_path.exists() or dataset_path.stat().st_size == 0:
-            raise RuntimeError("Downloaded dataset.wav is missing or empty.")
-        print(json.dumps({"event": "download_done", "bytes": dataset_path.stat().st_size}))
+        # Support either .wav or .flac keys.
+        if str(dataset_key).lower().endswith(".flac"):
+            client.download_file(bucket, dataset_key, str(dataset_flac_path))
+            if not dataset_flac_path.exists() or dataset_flac_path.stat().st_size == 0:
+                raise RuntimeError("Downloaded dataset.flac is missing or empty.")
+            # Decode to WAV for training
+            run(
+                [
+                    "ffmpeg",
+                    "-y",
+                    "-hide_banner",
+                    "-loglevel",
+                    "error",
+                    "-i",
+                    str(dataset_flac_path),
+                    str(dataset_path),
+                ]
+            )
+            if not dataset_path.exists() or dataset_path.stat().st_size == 0:
+                raise RuntimeError("Failed to decode FLAC to WAV.")
+            print(
+                json.dumps(
+                    {
+                        "event": "download_done",
+                        "bytes": dataset_flac_path.stat().st_size,
+                        "decodedWavBytes": dataset_path.stat().st_size,
+                    }
+                )
+            )
+        else:
+            client.download_file(bucket, dataset_key, str(dataset_path))
+            if not dataset_path.exists() or dataset_path.stat().st_size == 0:
+                raise RuntimeError("Downloaded dataset.wav is missing or empty.")
+            print(json.dumps({"event": "download_done", "bytes": dataset_path.stat().st_size}))
     except ClientError as e:
         raise RuntimeError(f"Failed to download from R2: s3://{bucket}/{dataset_key}\n{e}") from e
 
     audio_info = probe_audio(dataset_path)
     print(json.dumps({"event": "audio_probe", **audio_info}))
+
+    # Storage optimization: archive dataset as FLAC (lossless, smaller) for long-term storage.
+    if isinstance(dataset_archive_key, str) and dataset_archive_key:
+        try:
+            print(json.dumps({"event": "dataset_archive_start", "key": dataset_archive_key}))
+            ffmpeg_convert_to_flac(dataset_path, dataset_flac_path)
+            client.upload_file(str(dataset_flac_path), bucket, dataset_archive_key)
+            print(
+                json.dumps(
+                    {
+                        "event": "dataset_archive_done",
+                        "archiveBytes": dataset_flac_path.stat().st_size,
+                    }
+                )
+            )
+        except Exception as e:
+            # Don't block training if archiving fails; we can retry on next run.
+            print(json.dumps({"event": "dataset_archive_failed", "error": str(e)[:500]}))
 
     if PREREQ_MARKER.exists():
         print(json.dumps({"event": "applio_prerequisites_skip", "reason": "baked_into_image"}))
@@ -653,6 +728,8 @@ def handler(job):
             "g": str(CUSTOM_PRETRAIN_G_PATH),
             "d": str(CUSTOM_PRETRAIN_D_PATH),
         },
+        "datasetArchiveKey": dataset_archive_key,
+        "datasetArchiveBytes": dataset_flac_path.stat().st_size if dataset_flac_path.exists() else None,
     }
 
 
