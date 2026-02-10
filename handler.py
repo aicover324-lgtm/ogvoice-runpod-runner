@@ -12,6 +12,14 @@ import runpod
 from botocore.config import Config
 from botocore.exceptions import ClientError
 
+try:
+    import torch  # type: ignore
+
+    _TORCH_AVAILABLE = True
+except Exception:
+    torch = None  # type: ignore
+    _TORCH_AVAILABLE = False
+
 
 APPLIO_DIR = Path("/content/Applio")
 WORK_DIR = Path("/workspace")
@@ -140,6 +148,49 @@ def run(cmd, cwd=None):
         tail = (p.stdout or "")[-8000:]
         raise RuntimeError(f"Command failed ({p.returncode}): {' '.join(cmd)}\n\n{tail}")
     return p.stdout or ""
+
+
+def get_gpu_diagnostics():
+    info = {
+        "torchAvailable": _TORCH_AVAILABLE,
+        "cudaAvailable": False,
+        "cudaDeviceCount": 0,
+        "cudaVersion": None,
+        "deviceNames": [],
+        "nvidiaSmi": None,
+    }
+
+    # Best signal: torch sees CUDA
+    if _TORCH_AVAILABLE and torch is not None:
+        try:
+            info["cudaAvailable"] = bool(torch.cuda.is_available())
+            info["cudaDeviceCount"] = int(torch.cuda.device_count()) if info["cudaAvailable"] else 0
+            info["cudaVersion"] = getattr(getattr(torch, "version", None), "cuda", None)
+            if info["cudaAvailable"] and info["cudaDeviceCount"] > 0:
+                names = []
+                for i in range(info["cudaDeviceCount"]):
+                    try:
+                        names.append(str(torch.cuda.get_device_name(i)))
+                    except Exception:
+                        names.append(f"cuda:{i}")
+                info["deviceNames"] = names
+        except Exception:
+            pass
+
+    # Secondary signal: nvidia-smi output (if present)
+    try:
+        smi = subprocess.run(
+            ["nvidia-smi", "-L"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=5,
+        )
+        info["nvidiaSmi"] = (smi.stdout or "").strip()[:2000]
+    except Exception:
+        info["nvidiaSmi"] = None
+
+    return info
 
 
 def ensure_applio():
@@ -383,6 +434,18 @@ def handler(job):
             }
         )
     )
+
+    gpu = get_gpu_diagnostics()
+    print(json.dumps({"event": "gpu_diagnostics", **gpu}))
+    if not gpu.get("cudaAvailable"):
+        raise RuntimeError(
+            "CUDA is not available in this worker. "
+            "Training is configured to run on GPU; please attach a GPU worker."
+        )
+    if not gpu.get("deviceNames"):
+        raise RuntimeError("No CUDA devices detected.")
+    # Human-friendly confirmation line.
+    print(f"[{gpu['deviceNames'][0]}] is active for current training.")
 
     # Ensure advanced pretrained exists (download if missing)
     ensure_custom_pretrained()
