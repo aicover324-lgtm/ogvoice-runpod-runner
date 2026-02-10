@@ -23,6 +23,16 @@ RUN pip install --upgrade pip \
   && pip install --no-cache-dir -r /content/Applio/requirements.txt \
      --extra-index-url https://download.pytorch.org/whl/cu128
 
+# Preload Applio prerequisites at build time to avoid runtime downloads.
+# This reduces cold-start time and avoids wasting paid worker runtime.
+RUN python -u core.py prerequisites --models True --pretraineds_hifigan True --exe False \
+  && python - <<'PY'
+from pathlib import Path
+p = Path('/content/Applio/.prerequisites_ready')
+p.write_text('ok\n')
+print('Wrote', p)
+PY
+
 # Our runner deps
 COPY requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r /app/requirements.txt

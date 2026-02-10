@@ -15,6 +15,7 @@ from botocore.exceptions import ClientError
 
 APPLIO_DIR = Path("/content/Applio")
 WORK_DIR = Path("/workspace")
+PREREQ_MARKER = APPLIO_DIR / ".prerequisites_ready"
 
 # Always use these advanced pretrained weights (32k).
 # Default: baked into the image at /content/Applio/pretrained_custom/*.pth
@@ -46,6 +47,10 @@ FORCE_EMBEDDER_MODEL = "contentvec"
 FORCE_INCLUDE_MUTES = 2
 FORCE_BATCH_SIZE = 4
 FORCE_INDEX_ALGORITHM = "Auto"
+
+# "Noise filter" in Applio UI maps to the preprocess flag `--process_effects`.
+# This applies a simple filter during preprocessing.
+FORCE_PROCESS_EFFECTS = True
 
 # "Noise filter" in Applio UI maps to the preprocess flag `--process_effects`.
 # This applies a simple filter during preprocessing.
@@ -412,12 +417,27 @@ def handler(job):
     audio_info = probe_audio(dataset_path)
     print(json.dumps({"event": "audio_probe", **audio_info}))
 
-    print(json.dumps({"event": "applio_prerequisites_start"}))
-    run(
-        ["python", "core.py", "prerequisites", "--models", "True", "--pretraineds_hifigan", "True"],
-        cwd=str(APPLIO_DIR),
-    )
-    print(json.dumps({"event": "applio_prerequisites_done"}))
+    if PREREQ_MARKER.exists():
+        print(json.dumps({"event": "applio_prerequisites_skip", "reason": "baked_into_image"}))
+    else:
+        # Fallback: older images or custom builds.
+        print(json.dumps({"event": "applio_prerequisites_start"}))
+        run(
+            [
+                "python",
+                "core.py",
+                "prerequisites",
+                "--models",
+                "True",
+                "--pretraineds_hifigan",
+                "True",
+                "--exe",
+                "False",
+            ],
+            cwd=str(APPLIO_DIR),
+        )
+        PREREQ_MARKER.write_text("ok\n")
+        print(json.dumps({"event": "applio_prerequisites_done"}))
 
     # Applio's CLI limits cpu_cores to a fixed range (commonly max 64).
     # Some RunPod machines report higher counts (e.g. 128), which would crash.
