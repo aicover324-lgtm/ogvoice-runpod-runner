@@ -379,6 +379,108 @@ def export_inference_zip(model_name: str, out_zip: Path):
             zf.write(index_path, arcname=index_path.name)
 
 
+def clear_model_logs(model_name: str):
+    logs_dir = APPLIO_DIR / "logs" / model_name
+    if logs_dir.exists():
+        shutil.rmtree(logs_dir, ignore_errors=True)
+
+
+def _client_error_code(exc: ClientError):
+    try:
+        return str((exc.response or {}).get("Error", {}).get("Code", ""))
+    except Exception:
+        return ""
+
+
+def restore_checkpoint_archive_if_exists(client, bucket: str, checkpoint_key: str, local_zip: Path, model_name: str):
+    local_zip.parent.mkdir(parents=True, exist_ok=True)
+    if local_zip.exists():
+        local_zip.unlink()
+
+    try:
+        print(json.dumps({"event": "checkpoint_restore_start", "key": checkpoint_key}))
+        client.download_file(bucket, checkpoint_key, str(local_zip))
+    except ClientError as e:
+        code = _client_error_code(e)
+        if code in ("404", "NoSuchKey", "NotFound"):
+            print(json.dumps({"event": "checkpoint_restore_miss", "key": checkpoint_key}))
+            return {"used": False, "reason": "missing", "files": []}
+        raise
+
+    if (not local_zip.exists()) or local_zip.stat().st_size == 0:
+        print(json.dumps({"event": "checkpoint_restore_empty", "key": checkpoint_key}))
+        return {"used": False, "reason": "empty", "files": []}
+
+    logs_dir = APPLIO_DIR / "logs" / model_name
+    logs_dir.mkdir(parents=True, exist_ok=True)
+
+    extracted = []
+    with zipfile.ZipFile(local_zip, "r") as zf:
+        for member in zf.infolist():
+            name = Path(member.filename).name
+            if not name:
+                continue
+            if not (name.startswith("G_") or name.startswith("D_")):
+                continue
+            if not name.endswith(".pth"):
+                continue
+
+            dest = logs_dir / name
+            with zf.open(member, "r") as src, open(dest, "wb") as dst:
+                shutil.copyfileobj(src, dst)
+            extracted.append(name)
+
+    used = len(extracted) > 0
+    print(
+        json.dumps(
+            {
+                "event": "checkpoint_restore_done",
+                "key": checkpoint_key,
+                "used": used,
+                "files": extracted,
+            }
+        )
+    )
+    return {"used": used, "reason": "ok" if used else "no_checkpoint_files", "files": extracted}
+
+
+def create_checkpoint_archive(model_name: str, out_zip: Path):
+    logs_dir = APPLIO_DIR / "logs" / model_name
+    if not logs_dir.exists():
+        return None
+
+    g_ckpts = sorted(logs_dir.glob("G_*.pth"), key=lambda p: p.stat().st_mtime, reverse=True)
+    d_ckpts = sorted(logs_dir.glob("D_*.pth"), key=lambda p: p.stat().st_mtime, reverse=True)
+    if not g_ckpts or not d_ckpts:
+        return None
+
+    g = g_ckpts[0]
+    d = d_ckpts[0]
+
+    out_zip.parent.mkdir(parents=True, exist_ok=True)
+    if out_zip.exists():
+        out_zip.unlink()
+
+    meta = {
+        "modelName": model_name,
+        "createdAt": int(time.time()),
+        "generator": g.name,
+        "discriminator": d.name,
+    }
+
+    with zipfile.ZipFile(out_zip, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        zf.write(g, arcname=g.name)
+        zf.write(d, arcname=d.name)
+        zf.writestr("checkpoint_meta.json", json.dumps(meta))
+
+    return {
+        "zip": out_zip,
+        "g": g.name,
+        "d": d.name,
+        "bytes": out_zip.stat().st_size,
+    }
+
+
 def handler(job):
     ensure_applio()
     validate_forced_sample_rate()
@@ -394,6 +496,10 @@ def handler(job):
     dataset_key = inp["datasetKey"]
     out_key = inp["outKey"]
     dataset_archive_key = inp.get("datasetArchiveKey")
+    checkpoint_key = inp.get("checkpointKey")
+    if not isinstance(checkpoint_key, str) or not checkpoint_key:
+        checkpoint_key = None
+    resume_from_checkpoint = as_bool(inp.get("resumeFromCheckpoint"), True)
 
     model_name = inp.get("modelName")
 
@@ -422,7 +528,11 @@ def handler(job):
 
     batch_size = FORCE_BATCH_SIZE
 
-    save_every_epoch = as_int(inp.get("saveEveryEpoch"), 10)
+    save_every_epoch = as_int(inp.get("saveEveryEpoch"), 1)
+    if save_every_epoch < 1:
+        save_every_epoch = 1
+    if save_every_epoch > 100:
+        save_every_epoch = 100
     save_only_latest = as_bool(inp.get("saveOnlyLatest"), True)
 
     vocoder = FORCE_VOCODER
@@ -446,6 +556,7 @@ def handler(job):
                 "sr": sr,
                 "totalEpoch": total_epoch,
                 "batchSize": batch_size,
+                "saveEveryEpoch": save_every_epoch,
                 "vocoder": vocoder,
                 "cutPreprocess": cut_preprocess,
                 "processEffects": FORCE_PROCESS_EFFECTS,
@@ -457,6 +568,8 @@ def handler(job):
                 "pretrained": pretrained,
                 "customPretrained": custom_pretrained,
                 "saveOnlyLatest": save_only_latest,
+                "checkpointKey": checkpoint_key,
+                "resumeFromCheckpoint": resume_from_checkpoint,
             }
         )
     )
@@ -491,8 +604,26 @@ def handler(job):
     dataset_dir.mkdir(parents=True, exist_ok=True)
     dataset_path = dataset_dir / "dataset.wav"
     dataset_flac_path = dataset_dir / "dataset.flac"
+    checkpoint_zip = job_dir / "checkpoint_resume.zip"
 
     client = s3()
+
+    resume_info = {"used": False, "reason": "disabled", "files": []}
+    if checkpoint_key and resume_from_checkpoint:
+        try:
+            resume_info = restore_checkpoint_archive_if_exists(
+                client=client,
+                bucket=bucket,
+                checkpoint_key=checkpoint_key,
+                local_zip=checkpoint_zip,
+                model_name=model_name,
+            )
+        except Exception as e:
+            print(json.dumps({"event": "checkpoint_restore_failed", "key": checkpoint_key, "error": str(e)[:500]}))
+            resume_info = {"used": False, "reason": "restore_error", "files": []}
+
+    if not resume_info.get("used"):
+        clear_model_logs(model_name)
 
     # Download dataset from R2
     try:
@@ -702,8 +833,45 @@ def handler(job):
         "--vocoder",
         vocoder,
     ]
-    run(train_cmd, cwd=str(APPLIO_DIR))
-    print(json.dumps({"event": "train_done"}))
+    train_error = None
+    try:
+        run(train_cmd, cwd=str(APPLIO_DIR))
+        print(json.dumps({"event": "train_done"}))
+    except Exception as e:
+        train_error = e
+        print(json.dumps({"event": "train_failed", "error": str(e)[:1000]}))
+
+    checkpoint_upload = None
+    if checkpoint_key:
+        try:
+            checkpoint_bundle = create_checkpoint_archive(model_name, checkpoint_zip)
+            if checkpoint_bundle:
+                print(
+                    json.dumps(
+                        {
+                            "event": "checkpoint_upload_start",
+                            "key": checkpoint_key,
+                            "bytes": checkpoint_bundle["bytes"],
+                            "g": checkpoint_bundle["g"],
+                            "d": checkpoint_bundle["d"],
+                        }
+                    )
+                )
+                client.upload_file(str(checkpoint_bundle["zip"]), bucket, checkpoint_key)
+                checkpoint_upload = {
+                    "key": checkpoint_key,
+                    "bytes": checkpoint_bundle["bytes"],
+                    "g": checkpoint_bundle["g"],
+                    "d": checkpoint_bundle["d"],
+                }
+                print(json.dumps({"event": "checkpoint_upload_done", **checkpoint_upload}))
+            else:
+                print(json.dumps({"event": "checkpoint_upload_skip", "reason": "no_checkpoint_files"}))
+        except Exception as e:
+            print(json.dumps({"event": "checkpoint_upload_failed", "key": checkpoint_key, "error": str(e)[:500]}))
+
+    if train_error is not None:
+        raise train_error
 
     out_zip = job_dir / "model.zip"
     print(json.dumps({"event": "export_start", "zip": str(out_zip)}))
@@ -728,6 +896,12 @@ def handler(job):
             "g": str(CUSTOM_PRETRAIN_G_PATH),
             "d": str(CUSTOM_PRETRAIN_D_PATH),
         },
+        "resume": {
+            "used": bool(resume_info.get("used")),
+            "reason": resume_info.get("reason"),
+            "files": resume_info.get("files"),
+        },
+        "checkpoint": checkpoint_upload,
         "datasetArchiveKey": dataset_archive_key,
         "datasetArchiveBytes": dataset_flac_path.stat().st_size if dataset_flac_path.exists() else None,
     }
