@@ -842,7 +842,7 @@ def handler(job):
         print(json.dumps({"event": "train_failed", "error": str(e)[:1000]}))
 
     checkpoint_upload = None
-    if checkpoint_key:
+    if checkpoint_key and train_error is not None:
         try:
             checkpoint_bundle = create_checkpoint_archive(model_name, checkpoint_zip)
             if checkpoint_bundle:
@@ -869,6 +869,8 @@ def handler(job):
                 print(json.dumps({"event": "checkpoint_upload_skip", "reason": "no_checkpoint_files"}))
         except Exception as e:
             print(json.dumps({"event": "checkpoint_upload_failed", "key": checkpoint_key, "error": str(e)[:500]}))
+    elif checkpoint_key:
+        print(json.dumps({"event": "checkpoint_upload_skip", "reason": "success_not_needed"}))
 
     if train_error is not None:
         raise train_error
