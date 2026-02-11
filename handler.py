@@ -481,12 +481,213 @@ def create_checkpoint_archive(model_name: str, out_zip: Path):
     }
 
 
+def _clamp(v: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, v))
+
+
+def extract_model_artifact(zip_path: Path, dest_dir: Path):
+    if not zip_path.exists() or zip_path.stat().st_size == 0:
+        raise RuntimeError("Model artifact zip is missing or empty.")
+
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    pth_files = []
+    index_files = []
+
+    with zipfile.ZipFile(zip_path, "r") as zf:
+        for member in zf.infolist():
+            name = Path(member.filename).name
+            if not name:
+                continue
+            lower = name.lower()
+            if not (lower.endswith(".pth") or lower.endswith(".index")):
+                continue
+
+            target = dest_dir / name
+            with zf.open(member, "r") as src, open(target, "wb") as dst:
+                shutil.copyfileobj(src, dst)
+
+            if lower.endswith(".pth"):
+                pth_files.append(target)
+            elif lower.endswith(".index"):
+                index_files.append(target)
+
+    if not pth_files:
+        raise RuntimeError("Model zip does not include a .pth file.")
+    if not index_files:
+        raise RuntimeError("Model zip does not include a .index file.")
+
+    pth = sorted(pth_files, key=lambda p: p.stat().st_mtime, reverse=True)[0]
+    idx = sorted(index_files, key=lambda p: p.stat().st_mtime, reverse=True)[0]
+    return {"pth": pth, "index": idx}
+
+
+def handle_infer_job(job, inp, bucket: str, client):
+    if "modelKey" not in inp:
+        raise RuntimeError("Missing required input: modelKey")
+    if "inputKey" not in inp:
+        raise RuntimeError("Missing required input: inputKey")
+    if "outKey" not in inp:
+        raise RuntimeError("Missing required input: outKey")
+
+    model_key = inp["modelKey"]
+    input_key = inp["inputKey"]
+    out_key = inp["outKey"]
+
+    pitch = as_int(inp.get("pitch"), 0)
+    if pitch < -24:
+        pitch = -24
+    if pitch > 24:
+        pitch = 24
+
+    index_rate = _clamp(as_float(inp.get("searchFeatureRatio"), 0.75), 0.0, 1.0)
+    split_audio = as_bool(inp.get("splitAudio"), True)
+
+    protect = _clamp(as_float(inp.get("protect"), 0.33), 0.0, 0.5)
+    f0_method = str(inp.get("f0Method") or "rmvpe")
+    embedder_model = str(inp.get("embedderModel") or "contentvec")
+    export_format = str(inp.get("exportFormat") or "WAV").upper()
+    if export_format not in ("WAV", "MP3", "FLAC", "OGG", "M4A"):
+        export_format = "WAV"
+
+    req_id = (job or {}).get("id", "infer")
+    work = WORK_DIR / f"infer_{str(req_id)[:12]}"
+    work.mkdir(parents=True, exist_ok=True)
+
+    input_suffix = Path(str(input_key)).suffix or ".wav"
+    input_path = work / f"input_audio{input_suffix}"
+    model_zip = work / "model.zip"
+    model_dir = work / "model"
+    output_path = work / "converted.wav"
+
+    gpu = get_gpu_diagnostics()
+    print(json.dumps({"event": "gpu_diagnostics", **gpu}))
+    if not gpu.get("cudaAvailable"):
+        raise RuntimeError(
+            "CUDA is not available in this worker. "
+            "Voice conversion is configured to run on GPU; please attach a GPU worker."
+        )
+
+    print(
+        json.dumps(
+            {
+                "event": "infer_start",
+                "modelKey": model_key,
+                "inputKey": input_key,
+                "outKey": out_key,
+                "pitch": pitch,
+                "searchFeatureRatio": index_rate,
+                "splitAudio": split_audio,
+                "f0Method": f0_method,
+                "embedderModel": embedder_model,
+                "exportFormat": export_format,
+            }
+        )
+    )
+
+    try:
+        print(json.dumps({"event": "infer_download_model_start", "key": model_key}))
+        client.download_file(bucket, model_key, str(model_zip))
+        print(json.dumps({"event": "infer_download_model_done", "bytes": model_zip.stat().st_size}))
+    except ClientError as e:
+        raise RuntimeError(f"Failed to download model zip: s3://{bucket}/{model_key}\n{e}") from e
+
+    try:
+        print(json.dumps({"event": "infer_download_input_start", "key": input_key}))
+        client.download_file(bucket, input_key, str(input_path))
+        if not input_path.exists() or input_path.stat().st_size == 0:
+            raise RuntimeError("Input audio file is missing or empty after download.")
+        print(json.dumps({"event": "infer_download_input_done", "bytes": input_path.stat().st_size}))
+    except ClientError as e:
+        raise RuntimeError(f"Failed to download input audio: s3://{bucket}/{input_key}\n{e}") from e
+
+    model_files = extract_model_artifact(model_zip, model_dir)
+
+    infer_cmd = [
+        "python",
+        "core.py",
+        "infer",
+        "--pitch",
+        str(pitch),
+        "--index_rate",
+        str(index_rate),
+        "--volume_envelope",
+        "1",
+        "--protect",
+        str(protect),
+        "--f0_method",
+        f0_method,
+        "--input_path",
+        str(input_path),
+        "--output_path",
+        str(output_path),
+        "--pth_path",
+        str(model_files["pth"]),
+        "--index_path",
+        str(model_files["index"]),
+        "--split_audio",
+        str(split_audio),
+        "--f0_autotune",
+        "False",
+        "--proposed_pitch",
+        "False",
+        "--clean_audio",
+        "False",
+        "--formant_shifting",
+        "False",
+        "--post_process",
+        "False",
+        "--export_format",
+        export_format,
+        "--embedder_model",
+        embedder_model,
+        "--embedder_model_custom",
+        "",
+        "--sid",
+        "0",
+    ]
+
+    print(json.dumps({"event": "infer_convert_start"}))
+    run(infer_cmd, cwd=str(APPLIO_DIR))
+    print(json.dumps({"event": "infer_convert_done"}))
+
+    if export_format == "WAV":
+        result_path = output_path
+    else:
+        result_path = Path(str(output_path).replace(".wav", f".{export_format.lower()}"))
+
+    if not result_path.exists() or result_path.stat().st_size == 0:
+        raise RuntimeError("Voice conversion finished but output audio is missing.")
+
+    try:
+        print(json.dumps({"event": "infer_upload_start", "key": out_key, "bytes": result_path.stat().st_size}))
+        client.upload_file(str(result_path), bucket, out_key)
+        print(json.dumps({"event": "infer_upload_done"}))
+    except ClientError as e:
+        raise RuntimeError(f"Failed to upload conversion output: s3://{bucket}/{out_key}\n{e}") from e
+
+    return {
+        "ok": True,
+        "mode": "infer",
+        "outputKey": out_key,
+        "outputBytes": result_path.stat().st_size,
+        "pitch": pitch,
+        "searchFeatureRatio": index_rate,
+        "splitAudio": split_audio,
+        "exportFormat": export_format,
+    }
+
+
 def handler(job):
     ensure_applio()
     validate_forced_sample_rate()
 
     bucket = require_env("R2_BUCKET")
     inp = (job or {}).get("input") or {}
+    mode = str(inp.get("mode") or "train").strip().lower()
+    client = s3()
+
+    if mode == "infer":
+        return handle_infer_job(job=job, inp=inp, bucket=bucket, client=client)
 
     if "datasetKey" not in inp:
         raise RuntimeError("Missing required input: datasetKey")
@@ -605,8 +806,6 @@ def handler(job):
     dataset_path = dataset_dir / "dataset.wav"
     dataset_flac_path = dataset_dir / "dataset.flac"
     checkpoint_zip = job_dir / "checkpoint_resume.zip"
-
-    client = s3()
 
     resume_info = {"used": False, "reason": "disabled", "files": []}
     if checkpoint_key and resume_from_checkpoint:
