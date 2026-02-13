@@ -74,11 +74,11 @@ FORCE_NOISE_REDUCTION = False
 
 VOCAL_SEP_MODEL = os.environ.get(
     "VOCAL_SEP_MODEL",
-    "vocals_mel_band_roformer.ckpt",
+    "model_mel_band_roformer_ep_3005_sdr_11.4360.ckpt",
 )
 KARAOKE_SEP_MODEL = os.environ.get(
     "KARAOKE_SEP_MODEL",
-    "mel_band_roformer_karaoke_aufr33_viperx_sdr_10.1956.ckpt",
+    "UVR_MDXNET_KARA_2.onnx",
 )
 
 
@@ -127,6 +127,34 @@ def as_float(v, default: float) -> float:
             return default
         return float(s)
     return default
+
+
+def csv_items(v) -> list[str]:
+    if not v:
+        return []
+    if isinstance(v, str):
+        return [part.strip() for part in v.split(",") if part and part.strip()]
+    if isinstance(v, (list, tuple)):
+        out = []
+        for item in v:
+            s = str(item).strip()
+            if s:
+                out.append(s)
+        return out
+    s = str(v).strip()
+    return [s] if s else []
+
+
+def unique_strings(values) -> list[str]:
+    out = []
+    seen = set()
+    for value in values or []:
+        s = str(value).strip()
+        if not s or s in seen:
+            continue
+        seen.add(s)
+        out.append(s)
+    return out
 
 
 def s3():
@@ -537,6 +565,7 @@ def separate_vocals_and_instrumental(
     input_audio: Path,
     out_dir: Path,
     model_filename: str,
+    fallback_model_filenames=None,
     vocals_name: str,
     instrumental_name: str,
 ):
@@ -571,7 +600,48 @@ def separate_vocals_and_instrumental(
         effective_kwargs = {k: v for k, v in separator_kwargs.items() if k in ctor_params}
 
     separator = Separator(**effective_kwargs)
-    separator.load_model(model_filename=model_filename)
+
+    model_candidates = unique_strings([model_filename] + csv_items(fallback_model_filenames))
+    model_used = None
+    last_model_error = None
+
+    for candidate in model_candidates:
+        try:
+            separator.load_model(model_filename=candidate)
+            model_used = candidate
+            if candidate != model_filename:
+                print(
+                    json.dumps(
+                        {
+                            "event": "stem_model_fallback_used",
+                            "requested": model_filename,
+                            "selected": candidate,
+                        }
+                    )
+                )
+            break
+        except ValueError as e:
+            msg = str(e)
+            if "not found in supported model files" in msg.lower():
+                last_model_error = e
+                print(
+                    json.dumps(
+                        {
+                            "event": "stem_model_unsupported",
+                            "requested": candidate,
+                            "error": msg[:500],
+                        }
+                    )
+                )
+                continue
+            raise
+
+    if model_used is None:
+        tried = model_candidates[:]
+        raise RuntimeError(
+            "No compatible audio-separator model could be loaded. "
+            f"Tried: {tried}. Last error: {last_model_error}"
+        ) from last_model_error
 
     produced = []
     try:
@@ -604,6 +674,7 @@ def separate_vocals_and_instrumental(
     return {
         "vocals": vocals_path,
         "instrumental": instrumental_path,
+        "modelUsed": model_used,
     }
 
 
@@ -816,6 +887,25 @@ def handle_infer_job(job, inp, bucket: str, client):
     require_gpu_requested = as_bool(inp.get("requireGpu"), True)
     require_gpu = True
 
+    vocal_sep_fallbacks = unique_strings(
+        csv_items(inp.get("vocalSepModelFallbacks"))
+        + csv_items(os.environ.get("VOCAL_SEP_MODEL_FALLBACKS"))
+        + [
+            "model_mel_band_roformer_ep_3005_sdr_11.4360.ckpt",
+            "UVR-MDX-NET-Inst_HQ_3.onnx",
+            "UVR_MDXNET_KARA_2.onnx",
+        ]
+    )
+    karaoke_sep_fallbacks = unique_strings(
+        csv_items(inp.get("karaokeSepModelFallbacks"))
+        + csv_items(os.environ.get("KARAOKE_SEP_MODEL_FALLBACKS"))
+        + [
+            "UVR_MDXNET_KARA_2.onnx",
+            "2_HP-UVR.pth",
+            "UVR-MDX-NET-Inst_HQ_3.onnx",
+        ]
+    )
+
     req_id = (job or {}).get("id", "infer")
     work = WORK_DIR / f"infer_{str(req_id)[:12]}"
     work.mkdir(parents=True, exist_ok=True)
@@ -860,6 +950,8 @@ def handle_infer_job(job, inp, bucket: str, client):
                 "addBackVocals": add_back_vocals,
                 "convertBackVocals": convert_back_vocals,
                 "mixWithInput": mix_with_input,
+                "vocalSepModel": VOCAL_SEP_MODEL,
+                "karaokeSepModel": KARAOKE_SEP_MODEL,
             }
         )
     )
@@ -887,9 +979,11 @@ def handle_infer_job(job, inp, bucket: str, client):
         input_audio=input_path,
         out_dir=stems_root / "main",
         model_filename=VOCAL_SEP_MODEL,
+        fallback_model_filenames=vocal_sep_fallbacks,
         vocals_name="main_vocals",
         instrumental_name="instrumental",
     )
+    main_model_used = main_stems.get("modelUsed")
     lead_source = main_stems["vocals"]
     instrumental_source = main_stems["instrumental"]
     print(
@@ -898,20 +992,24 @@ def handle_infer_job(job, inp, bucket: str, client):
                 "event": "stem_separation_main_done",
                 "leadSource": str(lead_source),
                 "instrumentalSource": str(instrumental_source),
+                "modelUsed": main_model_used,
             }
         )
     )
 
     backing_source = None
+    backing_model_used = None
     if add_back_vocals:
         print(json.dumps({"event": "stem_separation_backing_start", "model": KARAOKE_SEP_MODEL}))
         backing_stems = separate_vocals_and_instrumental(
             input_audio=lead_source,
             out_dir=stems_root / "backing",
             model_filename=KARAOKE_SEP_MODEL,
+            fallback_model_filenames=karaoke_sep_fallbacks,
             vocals_name="lead_main",
             instrumental_name="backing_vocals",
         )
+        backing_model_used = backing_stems.get("modelUsed")
         lead_source = backing_stems["vocals"]
         backing_source = backing_stems["instrumental"]
         print(
@@ -920,6 +1018,7 @@ def handle_infer_job(job, inp, bucket: str, client):
                     "event": "stem_separation_backing_done",
                     "leadSource": str(lead_source),
                     "backingSource": str(backing_source),
+                    "modelUsed": backing_model_used,
                 }
             )
         )
@@ -1035,12 +1134,16 @@ def handle_infer_job(job, inp, bucket: str, client):
         "convertBackVocals": convert_back_vocals,
         "mixedWithInput": mix_with_input,
         "requireGpu": require_gpu,
+        "stemModels": {
+            "main": main_model_used,
+            "backing": backing_model_used,
+        },
         "stemKeys": stem_keys,
     }
 
 
 def handler(job):
-    print(json.dumps({"event": "runner_build", "build": "sepfix-20260213-4"}))
+    print(json.dumps({"event": "runner_build", "build": "sepfix-20260213-5"}))
     log_runtime_dependency_info()
 
     ensure_applio()
