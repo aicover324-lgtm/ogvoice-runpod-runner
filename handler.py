@@ -559,7 +559,6 @@ def separate_vocals_and_instrumental(
         "output_dir": str(out_dir),
         "output_format": "WAV",
         "sample_rate": 44100,
-        "use_autocast": True,
     }
 
     ctor_params = inspect.signature(Separator.__init__).parameters
@@ -814,6 +813,8 @@ def handle_infer_job(job, inp, bucket: str, client):
     add_back_vocals = as_bool(inp.get("addBackVocals"), False)
     convert_back_vocals = as_bool(inp.get("convertBackVocals"), False)
     mix_with_input = as_bool(inp.get("mixWithInput"), True)
+    require_gpu_requested = as_bool(inp.get("requireGpu"), True)
+    require_gpu = True
 
     req_id = (job or {}).get("id", "infer")
     work = WORK_DIR / f"infer_{str(req_id)[:12]}"
@@ -827,10 +828,20 @@ def handle_infer_job(job, inp, bucket: str, client):
 
     gpu = get_gpu_diagnostics()
     print(json.dumps({"event": "gpu_diagnostics", **gpu}))
+    if not require_gpu_requested:
+        print(
+            json.dumps(
+                {
+                    "event": "infer_require_gpu_forced",
+                    "requested": False,
+                    "using": True,
+                }
+            )
+        )
     if not gpu.get("cudaAvailable"):
         raise RuntimeError(
             "CUDA is not available in this worker. "
-            "Voice conversion is configured to run on GPU; please attach a GPU worker."
+            "GPU is required for inference; CPU fallback is disabled."
         )
 
     print(
@@ -1023,11 +1034,15 @@ def handle_infer_job(job, inp, bucket: str, client):
         "addBackVocals": add_back_vocals,
         "convertBackVocals": convert_back_vocals,
         "mixedWithInput": mix_with_input,
+        "requireGpu": require_gpu,
         "stemKeys": stem_keys,
     }
 
 
 def handler(job):
+    print(json.dumps({"event": "runner_build", "build": "sepfix-20260213-4"}))
+    log_runtime_dependency_info()
+
     ensure_applio()
     validate_forced_sample_rate()
 
