@@ -543,8 +543,8 @@ def separate_vocals_and_instrumental(
         from audio_separator.separator import Separator
     except Exception as e:
         raise RuntimeError(
-            "audio-separator is not installed in this runner image. "
-            "Please rebuild with updated requirements."
+            "audio-separator (or a required dependency such as onnxruntime) "
+            "is missing in this runner image. Please rebuild with updated requirements."
         ) from e
 
     out_dir.mkdir(parents=True, exist_ok=True)
