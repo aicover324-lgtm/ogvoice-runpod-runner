@@ -5,6 +5,7 @@ import subprocess
 import zipfile
 import time
 import logging
+import inspect
 from pathlib import Path
 from urllib.request import Request, urlopen
 
@@ -552,14 +553,25 @@ def separate_vocals_and_instrumental(
     model_cache = WORK_DIR / "audio_separator_models"
     model_cache.mkdir(parents=True, exist_ok=True)
 
-    separator = Separator(
-        log_level=logging.WARNING,
-        model_file_dir=str(model_cache),
-        output_dir=str(out_dir),
-        output_format="WAV",
-        sample_rate=44100,
-        use_autocast=True,
+    separator_kwargs = {
+        "log_level": logging.WARNING,
+        "model_file_dir": str(model_cache),
+        "output_dir": str(out_dir),
+        "output_format": "WAV",
+        "sample_rate": 44100,
+        "use_autocast": True,
+    }
+
+    ctor_params = inspect.signature(Separator.__init__).parameters
+    accepts_var_kwargs = any(
+        p.kind == inspect.Parameter.VAR_KEYWORD for p in ctor_params.values()
     )
+    if accepts_var_kwargs:
+        effective_kwargs = separator_kwargs
+    else:
+        effective_kwargs = {k: v for k, v in separator_kwargs.items() if k in ctor_params}
+
+    separator = Separator(**effective_kwargs)
     separator.load_model(model_filename=model_filename)
 
     produced = []
