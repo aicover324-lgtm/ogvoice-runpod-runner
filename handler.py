@@ -743,6 +743,33 @@ def mix_cover_tracks(*, lead_path: Path, inst_path: Path, backing_path: Path | N
     return out_path
 
 
+def normalize_audio_to_wav(*, src_path: Path, out_path: Path):
+    run(
+        [
+            "ffmpeg",
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-i",
+            str(src_path),
+            "-ar",
+            "44100",
+            "-ac",
+            "2",
+            str(out_path),
+        ]
+    )
+    if not out_path.exists() or out_path.stat().st_size == 0:
+        raise RuntimeError(f"Could not normalize audio to wav: {src_path}")
+    return out_path
+
+
+def stem_key_from_out_key(out_key: str, stem_name: str):
+    base = out_key.rsplit(".", 1)[0] if "." in out_key else out_key
+    return f"{base}__{stem_name}.wav"
+
+
 def handle_infer_job(job, inp, bucket: str, client):
     if "modelKey" not in inp:
         raise RuntimeError("Missing required input: modelKey")
@@ -936,6 +963,34 @@ def handle_infer_job(job, inp, bucket: str, client):
             )
         )
 
+    stem_keys = {
+        "mainVocalsKey": stem_key_from_out_key(out_key, "main_vocals"),
+        "backVocalsKey": stem_key_from_out_key(out_key, "back_vocals") if add_back_vocals else None,
+        "instrumentalKey": stem_key_from_out_key(out_key, "instrumental"),
+    }
+
+    try:
+        main_preview = normalize_audio_to_wav(
+            src_path=lead_converted,
+            out_path=work / "preview_main_vocals.wav",
+        )
+        client.upload_file(str(main_preview), bucket, stem_keys["mainVocalsKey"])
+
+        instrumental_preview = normalize_audio_to_wav(
+            src_path=instrumental_source,
+            out_path=work / "preview_instrumental.wav",
+        )
+        client.upload_file(str(instrumental_preview), bucket, stem_keys["instrumentalKey"])
+
+        if add_back_vocals and backing_for_mix is not None and stem_keys["backVocalsKey"]:
+            backing_preview = normalize_audio_to_wav(
+                src_path=backing_for_mix,
+                out_path=work / "preview_back_vocals.wav",
+            )
+            client.upload_file(str(backing_preview), bucket, stem_keys["backVocalsKey"])
+    except Exception as e:
+        print(json.dumps({"event": "infer_stem_preview_upload_failed", "error": str(e)}))
+
     try:
         print(json.dumps({"event": "infer_upload_start", "key": out_key, "bytes": final_path.stat().st_size}))
         client.upload_file(str(final_path), bucket, out_key)
@@ -955,6 +1010,7 @@ def handle_infer_job(job, inp, bucket: str, client):
         "addBackVocals": add_back_vocals,
         "convertBackVocals": convert_back_vocals,
         "mixedWithInput": mix_with_input,
+        "stemKeys": stem_keys,
     }
 
 
