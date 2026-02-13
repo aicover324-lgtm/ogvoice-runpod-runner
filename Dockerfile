@@ -39,7 +39,7 @@ PY
 # Our runner deps
 COPY requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r /app/requirements.txt \
-  && python -c "import audio_separator, onnxruntime; print('audio_separator+onnxruntime OK')"
+  && python -c "import audio_separator, onnxruntime; print('audio_separator', getattr(audio_separator, '__version__', 'unknown'), 'onnxruntime', onnxruntime.__version__)"
 
 COPY handler.py /app/handler.py
 

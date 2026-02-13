@@ -543,8 +543,9 @@ def separate_vocals_and_instrumental(
         from audio_separator.separator import Separator
     except Exception as e:
         raise RuntimeError(
-            "audio-separator (or a required dependency such as onnxruntime) "
-            "is missing in this runner image. Please rebuild with updated requirements."
+            "audio-separator import failed. Ensure this runner image includes "
+            "audio-separator and onnxruntime-gpu (or onnxruntime). "
+            f"Root cause: {type(e).__name__}: {e}"
         ) from e
 
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -1445,5 +1446,26 @@ def handler(job):
     }
 
 
+def log_runtime_dependency_info() -> None:
+    info = {}
+
+    try:
+        import audio_separator  # type: ignore
+
+        info["audio_separator"] = getattr(audio_separator, "__version__", "unknown")
+    except Exception as e:
+        info["audio_separator_error"] = f"{type(e).__name__}: {e}"
+
+    try:
+        import onnxruntime as ort  # type: ignore
+
+        info["onnxruntime"] = getattr(ort, "__version__", "unknown")
+    except Exception as e:
+        info["onnxruntime_error"] = f"{type(e).__name__}: {e}"
+
+    print(json.dumps({"event": "runtime_dependency_info", **info}))
+
+
 if __name__ == "__main__":
+    log_runtime_dependency_info()
     runpod.serverless.start({"handler": handler})
