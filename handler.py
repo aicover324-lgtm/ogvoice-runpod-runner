@@ -4,6 +4,7 @@ import shutil
 import subprocess
 import zipfile
 import time
+import logging
 from pathlib import Path
 from urllib.request import Request, urlopen
 
@@ -69,6 +70,15 @@ FORCE_PROCESS_EFFECTS = True
 # - noise reduction: off
 FORCE_NOISE_FILTER = True
 FORCE_NOISE_REDUCTION = False
+
+VOCAL_SEP_MODEL = os.environ.get(
+    "VOCAL_SEP_MODEL",
+    "vocals_mel_band_roformer.ckpt",
+)
+KARAOKE_SEP_MODEL = os.environ.get(
+    "KARAOKE_SEP_MODEL",
+    "mel_band_roformer_karaoke_aufr33_viperx_sdr_10.1956.ckpt",
+)
 
 
 def require_env(name: str) -> str:
@@ -521,6 +531,218 @@ def extract_model_artifact(zip_path: Path, dest_dir: Path):
     return {"pth": pth, "index": idx}
 
 
+def separate_vocals_and_instrumental(
+    *,
+    input_audio: Path,
+    out_dir: Path,
+    model_filename: str,
+    vocals_name: str,
+    instrumental_name: str,
+):
+    try:
+        from audio_separator.separator import Separator
+    except Exception as e:
+        raise RuntimeError(
+            "audio-separator is not installed in this runner image. "
+            "Please rebuild with updated requirements."
+        ) from e
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    model_cache = WORK_DIR / "audio_separator_models"
+    model_cache.mkdir(parents=True, exist_ok=True)
+
+    separator = Separator(
+        log_level=logging.WARNING,
+        model_file_dir=str(model_cache),
+        output_dir=str(out_dir),
+        output_format="WAV",
+        sample_rate=44100,
+        use_autocast=True,
+    )
+    separator.load_model(model_filename=model_filename)
+
+    produced = []
+    try:
+        produced = separator.separate(
+            str(input_audio),
+            {
+                "Vocals": vocals_name,
+                "Instrumental": instrumental_name,
+            },
+        )
+    except TypeError:
+        produced = separator.separate(str(input_audio))
+
+    vocals_path = _resolve_stem_path(
+        out_dir=out_dir,
+        produced=produced,
+        preferred_tokens=[vocals_name, "vocals"],
+    )
+    instrumental_path = _resolve_stem_path(
+        out_dir=out_dir,
+        produced=produced,
+        preferred_tokens=[instrumental_name, "instrumental", "no_vocals"],
+    )
+
+    if vocals_path is None:
+        raise RuntimeError("Stem separation failed: vocals stem is missing.")
+    if instrumental_path is None:
+        raise RuntimeError("Stem separation failed: instrumental stem is missing.")
+
+    return {
+        "vocals": vocals_path,
+        "instrumental": instrumental_path,
+    }
+
+
+def _resolve_stem_path(*, out_dir: Path, produced, preferred_tokens):
+    candidates = []
+    for item in produced or []:
+        try:
+            p = Path(str(item))
+            if p.exists() and p.is_file():
+                candidates.append(p)
+        except Exception:
+            continue
+
+    if not candidates:
+        candidates = sorted(
+            out_dir.glob("**/*"),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+
+    lowered = [t.lower() for t in preferred_tokens if t]
+    for token in lowered:
+        for p in candidates:
+            if token in p.name.lower():
+                return p
+
+    return candidates[0] if candidates else None
+
+
+def run_rvc_infer_file(
+    *,
+    input_audio: Path,
+    output_wav: Path,
+    model_files,
+    pitch: int,
+    index_rate: float,
+    protect: float,
+    f0_method: str,
+    split_audio: bool,
+    export_format: str,
+    embedder_model: str,
+):
+    infer_cmd = [
+        "python",
+        "core.py",
+        "infer",
+        "--pitch",
+        str(pitch),
+        "--index_rate",
+        str(index_rate),
+        "--volume_envelope",
+        "1",
+        "--protect",
+        str(protect),
+        "--f0_method",
+        f0_method,
+        "--input_path",
+        str(input_audio),
+        "--output_path",
+        str(output_wav),
+        "--pth_path",
+        str(model_files["pth"]),
+        "--index_path",
+        str(model_files["index"]),
+        "--split_audio",
+        str(split_audio),
+        "--f0_autotune",
+        "False",
+        "--proposed_pitch",
+        "False",
+        "--clean_audio",
+        "False",
+        "--formant_shifting",
+        "False",
+        "--post_process",
+        "False",
+        "--export_format",
+        export_format,
+        "--embedder_model",
+        embedder_model,
+        "--embedder_model_custom",
+        "",
+        "--sid",
+        "0",
+    ]
+
+    run(infer_cmd, cwd=str(APPLIO_DIR))
+
+    if export_format == "WAV":
+        result_path = output_wav
+    else:
+        result_path = Path(str(output_wav).replace(".wav", f".{export_format.lower()}"))
+    if not result_path.exists() or result_path.stat().st_size == 0:
+        raise RuntimeError("RVC inference finished but output audio is missing.")
+    return result_path
+
+
+def mix_cover_tracks(*, lead_path: Path, inst_path: Path, backing_path: Path | None, out_path: Path, back_volume: float):
+    if backing_path is None:
+        filter_graph = "[0:a]volume=1.15[lead];[1:a]volume=0.95[inst];[lead][inst]amix=inputs=2:weights='1 1':normalize=0:dropout_transition=0[mix]"
+        cmd = [
+            "ffmpeg",
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-i",
+            str(lead_path),
+            "-i",
+            str(inst_path),
+            "-filter_complex",
+            filter_graph,
+            "-map",
+            "[mix]",
+            "-ar",
+            "44100",
+            "-ac",
+            "2",
+            str(out_path),
+        ]
+    else:
+        filter_graph = f"[0:a]volume=1.15[lead];[1:a]volume=0.95[inst];[2:a]volume={back_volume}[back];[inst][back]amix=inputs=2:weights='1 1':normalize=0:dropout_transition=0[bed];[lead][bed]amix=inputs=2:weights='1 1':normalize=0:dropout_transition=0[mix]"
+        cmd = [
+            "ffmpeg",
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-i",
+            str(lead_path),
+            "-i",
+            str(inst_path),
+            "-i",
+            str(backing_path),
+            "-filter_complex",
+            filter_graph,
+            "-map",
+            "[mix]",
+            "-ar",
+            "44100",
+            "-ac",
+            "2",
+            str(out_path),
+        ]
+
+    run(cmd)
+    if not out_path.exists() or out_path.stat().st_size == 0:
+        raise RuntimeError("Final mix output is missing.")
+    return out_path
+
+
 def handle_infer_job(job, inp, bucket: str, client):
     if "modelKey" not in inp:
         raise RuntimeError("Missing required input: modelKey")
@@ -548,6 +770,10 @@ def handle_infer_job(job, inp, bucket: str, client):
     export_format = str(inp.get("exportFormat") or "WAV").upper()
     if export_format not in ("WAV", "MP3", "FLAC", "OGG", "M4A"):
         export_format = "WAV"
+
+    add_back_vocals = as_bool(inp.get("addBackVocals"), False)
+    convert_back_vocals = as_bool(inp.get("convertBackVocals"), False)
+    mix_with_input = as_bool(inp.get("mixWithInput"), True)
 
     req_id = (job or {}).get("id", "infer")
     work = WORK_DIR / f"infer_{str(req_id)[:12]}"
@@ -580,6 +806,9 @@ def handle_infer_job(job, inp, bucket: str, client):
                 "f0Method": f0_method,
                 "embedderModel": embedder_model,
                 "exportFormat": export_format,
+                "addBackVocals": add_back_vocals,
+                "convertBackVocals": convert_back_vocals,
+                "mixWithInput": mix_with_input,
             }
         )
     )
@@ -601,66 +830,115 @@ def handle_infer_job(job, inp, bucket: str, client):
         raise RuntimeError(f"Failed to download input audio: s3://{bucket}/{input_key}\n{e}") from e
 
     model_files = extract_model_artifact(model_zip, model_dir)
+    stems_root = work / "stems"
+    print(json.dumps({"event": "stem_separation_main_start", "model": VOCAL_SEP_MODEL}))
+    main_stems = separate_vocals_and_instrumental(
+        input_audio=input_path,
+        out_dir=stems_root / "main",
+        model_filename=VOCAL_SEP_MODEL,
+        vocals_name="main_vocals",
+        instrumental_name="instrumental",
+    )
+    lead_source = main_stems["vocals"]
+    instrumental_source = main_stems["instrumental"]
+    print(
+        json.dumps(
+            {
+                "event": "stem_separation_main_done",
+                "leadSource": str(lead_source),
+                "instrumentalSource": str(instrumental_source),
+            }
+        )
+    )
 
-    infer_cmd = [
-        "python",
-        "core.py",
-        "infer",
-        "--pitch",
-        str(pitch),
-        "--index_rate",
-        str(index_rate),
-        "--volume_envelope",
-        "1",
-        "--protect",
-        str(protect),
-        "--f0_method",
-        f0_method,
-        "--input_path",
-        str(input_path),
-        "--output_path",
-        str(output_path),
-        "--pth_path",
-        str(model_files["pth"]),
-        "--index_path",
-        str(model_files["index"]),
-        "--split_audio",
-        str(split_audio),
-        "--f0_autotune",
-        "False",
-        "--proposed_pitch",
-        "False",
-        "--clean_audio",
-        "False",
-        "--formant_shifting",
-        "False",
-        "--post_process",
-        "False",
-        "--export_format",
-        export_format,
-        "--embedder_model",
-        embedder_model,
-        "--embedder_model_custom",
-        "",
-        "--sid",
-        "0",
-    ]
+    backing_source = None
+    if add_back_vocals:
+        print(json.dumps({"event": "stem_separation_backing_start", "model": KARAOKE_SEP_MODEL}))
+        backing_stems = separate_vocals_and_instrumental(
+            input_audio=lead_source,
+            out_dir=stems_root / "backing",
+            model_filename=KARAOKE_SEP_MODEL,
+            vocals_name="lead_main",
+            instrumental_name="backing_vocals",
+        )
+        lead_source = backing_stems["vocals"]
+        backing_source = backing_stems["instrumental"]
+        print(
+            json.dumps(
+                {
+                    "event": "stem_separation_backing_done",
+                    "leadSource": str(lead_source),
+                    "backingSource": str(backing_source),
+                }
+            )
+        )
 
-    print(json.dumps({"event": "infer_convert_start"}))
-    run(infer_cmd, cwd=str(APPLIO_DIR))
-    print(json.dumps({"event": "infer_convert_done"}))
+    print(json.dumps({"event": "infer_convert_main_start", "input": str(lead_source)}))
+    lead_converted = run_rvc_infer_file(
+        input_audio=lead_source,
+        output_wav=output_path,
+        model_files=model_files,
+        pitch=pitch,
+        index_rate=index_rate,
+        protect=protect,
+        f0_method=f0_method,
+        split_audio=split_audio,
+        export_format=export_format,
+        embedder_model=embedder_model,
+    )
+    print(json.dumps({"event": "infer_convert_main_done", "output": str(lead_converted)}))
 
-    if export_format == "WAV":
-        result_path = output_path
-    else:
-        result_path = Path(str(output_path).replace(".wav", f".{export_format.lower()}"))
+    backing_for_mix = None
+    if add_back_vocals:
+        if backing_source is None:
+            raise RuntimeError("Backing vocal stem is missing.")
+        if convert_back_vocals:
+            print(json.dumps({"event": "infer_convert_backing_start", "input": str(backing_source)}))
+            backing_output = work / "backing_converted.wav"
+            backing_for_mix = run_rvc_infer_file(
+                input_audio=backing_source,
+                output_wav=backing_output,
+                model_files=model_files,
+                pitch=pitch,
+                index_rate=index_rate,
+                protect=protect,
+                f0_method=f0_method,
+                split_audio=split_audio,
+                export_format=export_format,
+                embedder_model=embedder_model,
+            )
+            print(json.dumps({"event": "infer_convert_backing_done", "output": str(backing_for_mix)}))
+        else:
+            backing_for_mix = backing_source
 
-    if not result_path.exists() or result_path.stat().st_size == 0:
-        raise RuntimeError("Voice conversion finished but output audio is missing.")
+    final_path = lead_converted
+    if mix_with_input:
+        back_volume = 0.55 if not convert_back_vocals else 0.42
+        if not add_back_vocals:
+            back_volume = 0.0
+
+        mix_path = work / f"cover_mix.{export_format.lower()}"
+        final_path = mix_cover_tracks(
+            lead_path=lead_converted,
+            inst_path=instrumental_source,
+            backing_path=backing_for_mix if add_back_vocals else None,
+            out_path=mix_path,
+            back_volume=back_volume,
+        )
+        print(
+            json.dumps(
+                {
+                    "event": "infer_mix_done",
+                    "output": str(final_path),
+                    "includeBackVocals": add_back_vocals,
+                    "convertBackVocals": convert_back_vocals,
+                }
+            )
+        )
 
     try:
-        print(json.dumps({"event": "infer_upload_start", "key": out_key, "bytes": result_path.stat().st_size}))
-        client.upload_file(str(result_path), bucket, out_key)
+        print(json.dumps({"event": "infer_upload_start", "key": out_key, "bytes": final_path.stat().st_size}))
+        client.upload_file(str(final_path), bucket, out_key)
         print(json.dumps({"event": "infer_upload_done"}))
     except ClientError as e:
         raise RuntimeError(f"Failed to upload conversion output: s3://{bucket}/{out_key}\n{e}") from e
@@ -669,11 +947,14 @@ def handle_infer_job(job, inp, bucket: str, client):
         "ok": True,
         "mode": "infer",
         "outputKey": out_key,
-        "outputBytes": result_path.stat().st_size,
+        "outputBytes": final_path.stat().st_size,
         "pitch": pitch,
         "searchFeatureRatio": index_rate,
         "splitAudio": split_audio,
         "exportFormat": export_format,
+        "addBackVocals": add_back_vocals,
+        "convertBackVocals": convert_back_vocals,
+        "mixedWithInput": mix_with_input,
     }
 
 
