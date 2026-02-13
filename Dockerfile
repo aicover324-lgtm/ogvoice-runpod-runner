@@ -17,6 +17,14 @@ RUN mkdir -p /content \
   && cd /content \
   && git clone https://github.com/IAHispano/Applio --branch 3.6.0 --single-branch
 
+# Bundle Music Source Separation code used by RVC AI Cover Maker UI.
+# We use this path for Mel-Roformer stem models to match UI behavior.
+RUN git clone https://github.com/Eddycrack864/RVC-AI-Cover-Maker-UI --depth 1 /tmp/rvc_cover \
+  && mkdir -p /app/music_separation_code \
+  && cp -r /tmp/rvc_cover/programs/music_separation_code/* /app/music_separation_code/ \
+  && test -f /app/music_separation_code/inference.py \
+  && rm -rf /tmp/rvc_cover
+
 # Install Applio requirements.
 # IMPORTANT: include PyTorch cu128 index so torch==2.7.1+cu128 resolves.
 RUN pip install --upgrade pip \
@@ -39,7 +47,8 @@ PY
 # Our runner deps
 COPY requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r /app/requirements.txt \
-  && python -c "import audio_separator, onnxruntime; print('audio_separator', getattr(audio_separator, '__version__', 'unknown'), 'onnxruntime', onnxruntime.__version__)"
+  && python -c "import audio_separator, onnxruntime; print('audio_separator', getattr(audio_separator, '__version__', 'unknown'), 'onnxruntime', onnxruntime.__version__)" \
+  && python -c "import sys; sys.path.append('/app/music_separation_code'); import utils; print('music_separation_code OK')"
 
 COPY handler.py /app/handler.py
 

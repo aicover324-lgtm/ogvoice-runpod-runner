@@ -4,8 +4,6 @@ import shutil
 import subprocess
 import zipfile
 import time
-import logging
-import inspect
 from pathlib import Path
 from urllib.request import Request, urlopen
 
@@ -74,12 +72,43 @@ FORCE_NOISE_REDUCTION = False
 
 VOCAL_SEP_MODEL = os.environ.get(
     "VOCAL_SEP_MODEL",
-    "model_mel_band_roformer_ep_3005_sdr_11.4360.ckpt",
+    "Mel-Roformer by KimberleyJSN",
 )
 KARAOKE_SEP_MODEL = os.environ.get(
     "KARAOKE_SEP_MODEL",
-    "UVR_MDXNET_KARA_2.onnx",
+    "Mel-Roformer Karaoke by aufr33 and viperx",
 )
+
+MUSIC_SEPARATION_DIR = Path("/app/music_separation_code")
+MUSIC_SEPARATION_INFER = MUSIC_SEPARATION_DIR / "inference.py"
+
+STEM_MODEL_SPECS = {
+    "vocals": {
+        "id": "mel_vocals",
+        "name": "Mel-Roformer by KimberleyJSN",
+        "type": "mel_band_roformer",
+        "config_url": "https://raw.githubusercontent.com/ZFTurbo/Music-Source-Separation-Training/main/configs/KimberleyJensen/config_vocals_mel_band_roformer_kj.yaml",
+        "model_url": "https://huggingface.co/KimberleyJSN/melbandroformer/resolve/main/MelBandRoformer.ckpt",
+        "aliases": (
+            "mel-roformer by kimberleyjsn",
+            "vocals_mel_band_roformer.ckpt",
+            "model_mel_band_roformer_ep_3005_sdr_11.4360.ckpt",
+            "melbandroformer.ckpt",
+        ),
+    },
+    "karaoke": {
+        "id": "mel_karaoke",
+        "name": "Mel-Roformer Karaoke by aufr33 and viperx",
+        "type": "mel_band_roformer",
+        "config_url": "https://huggingface.co/shiromiya/audio-separation-models/resolve/main/mel_band_roformer_karaoke_aufr33_viperx/config_mel_band_roformer_karaoke.yaml",
+        "model_url": "https://huggingface.co/shiromiya/audio-separation-models/resolve/main/mel_band_roformer_karaoke_aufr33_viperx/mel_band_roformer_karaoke_aufr33_viperx_sdr_10.1956.ckpt",
+        "aliases": (
+            "mel-roformer karaoke by aufr33 and viperx",
+            "mel_band_roformer_karaoke_aufr33_viperx_sdr_10.1956.ckpt",
+            "uvr_mdxnet_kara_2.onnx",
+        ),
+    },
+}
 
 
 def require_env(name: str) -> str:
@@ -129,32 +158,8 @@ def as_float(v, default: float) -> float:
     return default
 
 
-def csv_items(v) -> list[str]:
-    if not v:
-        return []
-    if isinstance(v, str):
-        return [part.strip() for part in v.split(",") if part and part.strip()]
-    if isinstance(v, (list, tuple)):
-        out = []
-        for item in v:
-            s = str(item).strip()
-            if s:
-                out.append(s)
-        return out
-    s = str(v).strip()
-    return [s] if s else []
-
-
-def unique_strings(values) -> list[str]:
-    out = []
-    seen = set()
-    for value in values or []:
-        s = str(value).strip()
-        if not s or s in seen:
-            continue
-        seen.add(s)
-        out.append(s)
-    return out
+def normalized_model_name(v) -> str:
+    return str(v or "").strip().lower()
 
 
 def s3():
@@ -240,7 +245,13 @@ def ensure_applio():
         raise RuntimeError(f"Applio core.py not found: {core}")
 
 
-def download_file_http(url: str, dest: Path, retries: int = 3, timeout_sec: int = 120):
+def download_file_http(
+    url: str,
+    dest: Path,
+    retries: int = 3,
+    timeout_sec: int = 120,
+    min_bytes: int = 5_000_000,
+):
     dest.parent.mkdir(parents=True, exist_ok=True)
 
     tmp = dest.with_suffix(dest.suffix + ".tmp")
@@ -262,7 +273,7 @@ def download_file_http(url: str, dest: Path, retries: int = 3, timeout_sec: int 
                             break
                         f.write(chunk)
 
-            if not tmp.exists() or tmp.stat().st_size < 5_000_000:
+            if not tmp.exists() or tmp.stat().st_size < min_bytes:
                 raise RuntimeError(f"Downloaded file too small: {tmp.stat().st_size if tmp.exists() else 0} bytes")
 
             if dest.exists():
@@ -565,95 +576,77 @@ def separate_vocals_and_instrumental(
     input_audio: Path,
     out_dir: Path,
     model_filename: str,
-    fallback_model_filenames=None,
     vocals_name: str,
     instrumental_name: str,
 ):
-    try:
-        from audio_separator.separator import Separator
-    except Exception as e:
+    if not MUSIC_SEPARATION_INFER.exists():
         raise RuntimeError(
-            "audio-separator import failed. Ensure this runner image includes "
-            "audio-separator and onnxruntime-gpu (or onnxruntime). "
-            f"Root cause: {type(e).__name__}: {e}"
-        ) from e
+            "music_separation_code is missing in this runner image. "
+            "Please rebuild with updated Dockerfile."
+        )
+
+    role = "karaoke" if instrumental_name == "backing_vocals" else "vocals"
+    model_spec = STEM_MODEL_SPECS[role]
+    requested_model = str(model_filename or "")
+    requested_model_norm = normalized_model_name(requested_model)
+    accepted_aliases = set(model_spec["aliases"])
+    accepted_aliases.add(normalized_model_name(model_spec["name"]))
+
+    if requested_model_norm and requested_model_norm not in accepted_aliases:
+        print(
+            json.dumps(
+                {
+                    "event": "stem_model_forced",
+                    "role": role,
+                    "requested": requested_model,
+                    "using": model_spec["name"],
+                }
+            )
+        )
+
+    stem_model_dir = WORK_DIR / "music_separation_models" / model_spec["id"]
+    config_path = stem_model_dir / "config.yaml"
+    checkpoint_path = stem_model_dir / "model.ckpt"
+
+    if (not config_path.exists()) or config_path.stat().st_size < 100:
+        print(json.dumps({"event": "stem_model_config_download_start", "role": role, "url": model_spec["config_url"]}))
+        download_file_http(model_spec["config_url"], config_path, min_bytes=100)
+        print(json.dumps({"event": "stem_model_config_download_done", "role": role, "bytes": config_path.stat().st_size}))
+
+    if (not checkpoint_path.exists()) or checkpoint_path.stat().st_size < 5_000_000:
+        print(json.dumps({"event": "stem_model_checkpoint_download_start", "role": role, "url": model_spec["model_url"]}))
+        download_file_http(model_spec["model_url"], checkpoint_path, min_bytes=5_000_000)
+        print(json.dumps({"event": "stem_model_checkpoint_download_done", "role": role, "bytes": checkpoint_path.stat().st_size}))
 
     out_dir.mkdir(parents=True, exist_ok=True)
-    model_cache = WORK_DIR / "audio_separator_models"
-    model_cache.mkdir(parents=True, exist_ok=True)
 
-    separator_kwargs = {
-        "log_level": logging.WARNING,
-        "model_file_dir": str(model_cache),
-        "output_dir": str(out_dir),
-        "output_format": "WAV",
-        "sample_rate": 44100,
-    }
+    sep_cmd = [
+        "python",
+        str(MUSIC_SEPARATION_INFER),
+        "--model_type",
+        model_spec["type"],
+        "--config_path",
+        str(config_path),
+        "--start_check_point",
+        str(checkpoint_path),
+        "--input_file",
+        str(input_audio),
+        "--store_dir",
+        str(out_dir),
+        "--flac_file",
+        "--pcm_type",
+        "PCM_16",
+        "--extract_instrumental",
+        "--disable_detailed_pbar",
+    ]
 
-    ctor_params = inspect.signature(Separator.__init__).parameters
-    accepts_var_kwargs = any(
-        p.kind == inspect.Parameter.VAR_KEYWORD for p in ctor_params.values()
+    run(sep_cmd)
+
+    produced = sorted(
+        [p for p in out_dir.glob("**/*") if p.exists() and p.is_file()],
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
     )
-    if accepts_var_kwargs:
-        effective_kwargs = separator_kwargs
-    else:
-        effective_kwargs = {k: v for k, v in separator_kwargs.items() if k in ctor_params}
-
-    separator = Separator(**effective_kwargs)
-
-    model_candidates = unique_strings([model_filename] + csv_items(fallback_model_filenames))
-    model_used = None
-    last_model_error = None
-
-    for candidate in model_candidates:
-        try:
-            separator.load_model(model_filename=candidate)
-            model_used = candidate
-            if candidate != model_filename:
-                print(
-                    json.dumps(
-                        {
-                            "event": "stem_model_fallback_used",
-                            "requested": model_filename,
-                            "selected": candidate,
-                        }
-                    )
-                )
-            break
-        except ValueError as e:
-            msg = str(e)
-            if "not found in supported model files" in msg.lower():
-                last_model_error = e
-                print(
-                    json.dumps(
-                        {
-                            "event": "stem_model_unsupported",
-                            "requested": candidate,
-                            "error": msg[:500],
-                        }
-                    )
-                )
-                continue
-            raise
-
-    if model_used is None:
-        tried = model_candidates[:]
-        raise RuntimeError(
-            "No compatible audio-separator model could be loaded. "
-            f"Tried: {tried}. Last error: {last_model_error}"
-        ) from last_model_error
-
-    produced = []
-    try:
-        produced = separator.separate(
-            str(input_audio),
-            {
-                "Vocals": vocals_name,
-                "Instrumental": instrumental_name,
-            },
-        )
-    except TypeError:
-        produced = separator.separate(str(input_audio))
 
     vocals_path = _resolve_stem_path(
         out_dir=out_dir,
@@ -674,7 +667,7 @@ def separate_vocals_and_instrumental(
     return {
         "vocals": vocals_path,
         "instrumental": instrumental_path,
-        "modelUsed": model_used,
+        "modelUsed": model_spec["name"],
     }
 
 
@@ -690,7 +683,7 @@ def _resolve_stem_path(*, out_dir: Path, produced, preferred_tokens):
 
     if not candidates:
         candidates = sorted(
-            out_dir.glob("**/*"),
+            [p for p in out_dir.glob("**/*") if p.is_file()],
             key=lambda p: p.stat().st_mtime,
             reverse=True,
         )
@@ -887,24 +880,18 @@ def handle_infer_job(job, inp, bucket: str, client):
     require_gpu_requested = as_bool(inp.get("requireGpu"), True)
     require_gpu = True
 
-    vocal_sep_fallbacks = unique_strings(
-        csv_items(inp.get("vocalSepModelFallbacks"))
-        + csv_items(os.environ.get("VOCAL_SEP_MODEL_FALLBACKS"))
-        + [
-            "model_mel_band_roformer_ep_3005_sdr_11.4360.ckpt",
-            "UVR-MDX-NET-Inst_HQ_3.onnx",
-            "UVR_MDXNET_KARA_2.onnx",
-        ]
-    )
-    karaoke_sep_fallbacks = unique_strings(
-        csv_items(inp.get("karaokeSepModelFallbacks"))
-        + csv_items(os.environ.get("KARAOKE_SEP_MODEL_FALLBACKS"))
-        + [
-            "UVR_MDXNET_KARA_2.onnx",
-            "2_HP-UVR.pth",
-            "UVR-MDX-NET-Inst_HQ_3.onnx",
-        ]
-    )
+    vocal_sep_model = str(
+        inp.get("vocalStemModel")
+        or inp.get("vocalModel")
+        or inp.get("vocalSepModel")
+        or VOCAL_SEP_MODEL
+    ).strip()
+    karaoke_sep_model = str(
+        inp.get("karaokeStemModel")
+        or inp.get("karaokeModel")
+        or inp.get("karaokeSepModel")
+        or KARAOKE_SEP_MODEL
+    ).strip()
 
     req_id = (job or {}).get("id", "infer")
     work = WORK_DIR / f"infer_{str(req_id)[:12]}"
@@ -950,8 +937,8 @@ def handle_infer_job(job, inp, bucket: str, client):
                 "addBackVocals": add_back_vocals,
                 "convertBackVocals": convert_back_vocals,
                 "mixWithInput": mix_with_input,
-                "vocalSepModel": VOCAL_SEP_MODEL,
-                "karaokeSepModel": KARAOKE_SEP_MODEL,
+                "vocalSepModel": vocal_sep_model,
+                "karaokeSepModel": karaoke_sep_model,
             }
         )
     )
@@ -974,12 +961,11 @@ def handle_infer_job(job, inp, bucket: str, client):
 
     model_files = extract_model_artifact(model_zip, model_dir)
     stems_root = work / "stems"
-    print(json.dumps({"event": "stem_separation_main_start", "model": VOCAL_SEP_MODEL}))
+    print(json.dumps({"event": "stem_separation_main_start", "model": vocal_sep_model}))
     main_stems = separate_vocals_and_instrumental(
         input_audio=input_path,
         out_dir=stems_root / "main",
-        model_filename=VOCAL_SEP_MODEL,
-        fallback_model_filenames=vocal_sep_fallbacks,
+        model_filename=vocal_sep_model,
         vocals_name="main_vocals",
         instrumental_name="instrumental",
     )
@@ -1000,12 +986,11 @@ def handle_infer_job(job, inp, bucket: str, client):
     backing_source = None
     backing_model_used = None
     if add_back_vocals:
-        print(json.dumps({"event": "stem_separation_backing_start", "model": KARAOKE_SEP_MODEL}))
+        print(json.dumps({"event": "stem_separation_backing_start", "model": karaoke_sep_model}))
         backing_stems = separate_vocals_and_instrumental(
             input_audio=lead_source,
             out_dir=stems_root / "backing",
-            model_filename=KARAOKE_SEP_MODEL,
-            fallback_model_filenames=karaoke_sep_fallbacks,
+            model_filename=karaoke_sep_model,
             vocals_name="lead_main",
             instrumental_name="backing_vocals",
         )
@@ -1143,7 +1128,7 @@ def handle_infer_job(job, inp, bucket: str, client):
 
 
 def handler(job):
-    print(json.dumps({"event": "runner_build", "build": "sepfix-20260213-5"}))
+    print(json.dumps({"event": "runner_build", "build": "stemflow-20260213-1"}))
     log_runtime_dependency_info()
 
     ensure_applio()
@@ -1592,6 +1577,9 @@ def log_runtime_dependency_info() -> None:
         info["onnxruntime"] = getattr(ort, "__version__", "unknown")
     except Exception as e:
         info["onnxruntime_error"] = f"{type(e).__name__}: {e}"
+
+    info["music_separation_infer"] = str(MUSIC_SEPARATION_INFER)
+    info["music_separation_ready"] = bool(MUSIC_SEPARATION_INFER.exists())
 
     print(json.dumps({"event": "runtime_dependency_info", **info}))
 
