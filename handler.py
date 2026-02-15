@@ -1071,33 +1071,8 @@ def handle_infer_job(job, inp, bucket: str, client):
             )
         )
 
-    stem_keys = {
-        "mainVocalsKey": stem_key_from_out_key(out_key, "main_vocals"),
-        "backVocalsKey": stem_key_from_out_key(out_key, "back_vocals") if add_back_vocals else None,
-        "instrumentalKey": stem_key_from_out_key(out_key, "instrumental"),
-    }
-
-    try:
-        main_preview = normalize_audio_to_wav(
-            src_path=lead_converted,
-            out_path=work / "preview_main_vocals.wav",
-        )
-        client.upload_file(str(main_preview), bucket, stem_keys["mainVocalsKey"])
-
-        instrumental_preview = normalize_audio_to_wav(
-            src_path=instrumental_source,
-            out_path=work / "preview_instrumental.wav",
-        )
-        client.upload_file(str(instrumental_preview), bucket, stem_keys["instrumentalKey"])
-
-        if add_back_vocals and backing_for_mix is not None and stem_keys["backVocalsKey"]:
-            backing_preview = normalize_audio_to_wav(
-                src_path=backing_for_mix,
-                out_path=work / "preview_back_vocals.wav",
-            )
-            client.upload_file(str(backing_preview), bucket, stem_keys["backVocalsKey"])
-    except Exception as e:
-        print(json.dumps({"event": "infer_stem_preview_upload_failed", "error": str(e)}))
+    # Stem preview uploads are intentionally disabled to reduce storage usage.
+    # Final mixed output upload remains unchanged.
 
     try:
         print(json.dumps({"event": "infer_upload_start", "key": out_key, "bytes": final_path.stat().st_size}))
@@ -1123,12 +1098,12 @@ def handle_infer_job(job, inp, bucket: str, client):
             "main": main_model_used,
             "backing": backing_model_used,
         },
-        "stemKeys": stem_keys,
+        "stemKeys": None,
     }
 
 
 def handler(job):
-    print(json.dumps({"event": "runner_build", "build": "stemflow-20260213-1"}))
+    print(json.dumps({"event": "runner_build", "build": "stemflow-20260215-1"}))
     log_runtime_dependency_info()
 
     ensure_applio()
