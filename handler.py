@@ -531,6 +531,95 @@ def create_checkpoint_archive(model_name: str, out_zip: Path):
     }
 
 
+def restore_feature_cache_if_exists(client, bucket: str, feature_cache_key: str, local_zip: Path, model_name: str):
+    local_zip.parent.mkdir(parents=True, exist_ok=True)
+    if local_zip.exists():
+        local_zip.unlink()
+
+    try:
+        print(json.dumps({"event": "feature_cache_restore_start", "key": feature_cache_key}))
+        client.download_file(bucket, feature_cache_key, str(local_zip))
+    except ClientError as e:
+        code = _client_error_code(e)
+        if code in ("404", "NoSuchKey", "NotFound"):
+            print(json.dumps({"event": "feature_cache_restore_miss", "key": feature_cache_key}))
+            return {"used": False, "reason": "missing", "files": 0}
+        raise
+
+    if (not local_zip.exists()) or local_zip.stat().st_size == 0:
+        print(json.dumps({"event": "feature_cache_restore_empty", "key": feature_cache_key}))
+        return {"used": False, "reason": "empty", "files": 0}
+
+    logs_dir = APPLIO_DIR / "logs" / model_name
+    logs_dir.mkdir(parents=True, exist_ok=True)
+
+    extracted = 0
+    with zipfile.ZipFile(local_zip, "r") as zf:
+        for member in zf.infolist():
+            if member.is_dir():
+                continue
+            rel = Path(member.filename)
+            parts = [p for p in rel.parts if p not in ("", ".")]
+            if not parts or any(p == ".." for p in parts):
+                continue
+
+            dest = logs_dir.joinpath(*parts)
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            with zf.open(member, "r") as src, open(dest, "wb") as dst:
+                shutil.copyfileobj(src, dst)
+            extracted += 1
+
+    has_index = any(logs_dir.glob("*.index"))
+    used = extracted > 0 and has_index
+    print(
+        json.dumps(
+            {
+                "event": "feature_cache_restore_done",
+                "key": feature_cache_key,
+                "used": used,
+                "files": extracted,
+                "hasIndex": has_index,
+            }
+        )
+    )
+    if not used:
+        return {"used": False, "reason": "invalid", "files": extracted}
+    return {"used": True, "reason": "ok", "files": extracted}
+
+
+def create_feature_cache_archive(model_name: str, out_zip: Path):
+    logs_dir = APPLIO_DIR / "logs" / model_name
+    if not logs_dir.exists():
+        return None
+
+    files = []
+    for p in logs_dir.rglob("*"):
+        if not p.is_file():
+            continue
+        lower = p.name.lower()
+        if lower.endswith(".pth"):
+            continue
+        files.append(p)
+
+    if not files:
+        return None
+
+    out_zip.parent.mkdir(parents=True, exist_ok=True)
+    if out_zip.exists():
+        out_zip.unlink()
+
+    with zipfile.ZipFile(out_zip, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for p in files:
+            rel = p.relative_to(logs_dir).as_posix()
+            zf.write(p, arcname=rel)
+
+    return {
+        "zip": out_zip,
+        "bytes": out_zip.stat().st_size,
+        "files": len(files),
+    }
+
+
 def _clamp(v: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, v))
 
@@ -1103,7 +1192,7 @@ def handle_infer_job(job, inp, bucket: str, client):
 
 
 def handler(job):
-    print(json.dumps({"event": "runner_build", "build": "stemflow-20260215-1"}))
+    print(json.dumps({"event": "runner_build", "build": "stemflow-20260216-2"}))
     log_runtime_dependency_info()
 
     ensure_applio()
@@ -1128,6 +1217,10 @@ def handler(job):
     checkpoint_key = inp.get("checkpointKey")
     if not isinstance(checkpoint_key, str) or not checkpoint_key:
         checkpoint_key = None
+    feature_cache_key = inp.get("featureCacheKey")
+    if not isinstance(feature_cache_key, str) or not feature_cache_key:
+        feature_cache_key = None
+    upload_feature_cache = as_bool(inp.get("uploadFeatureCache"), True)
     resume_from_checkpoint = as_bool(inp.get("resumeFromCheckpoint"), True)
 
     model_name = inp.get("modelName")
@@ -1198,6 +1291,8 @@ def handler(job):
                 "customPretrained": custom_pretrained,
                 "saveOnlyLatest": save_only_latest,
                 "checkpointKey": checkpoint_key,
+                "featureCacheKey": feature_cache_key,
+                "uploadFeatureCache": upload_feature_cache,
                 "resumeFromCheckpoint": resume_from_checkpoint,
             }
         )
@@ -1234,6 +1329,7 @@ def handler(job):
     dataset_path = dataset_dir / "dataset.wav"
     dataset_flac_path = dataset_dir / "dataset.flac"
     checkpoint_zip = job_dir / "checkpoint_resume.zip"
+    feature_cache_zip = job_dir / "feature_cache_restore.zip"
 
     resume_info = {"used": False, "reason": "disabled", "files": []}
     if checkpoint_key and resume_from_checkpoint:
@@ -1251,6 +1347,20 @@ def handler(job):
 
     if not resume_info.get("used"):
         clear_model_logs(model_name)
+
+    feature_cache_info = {"used": False, "reason": "disabled", "files": 0}
+    if feature_cache_key:
+        try:
+            feature_cache_info = restore_feature_cache_if_exists(
+                client=client,
+                bucket=bucket,
+                feature_cache_key=feature_cache_key,
+                local_zip=feature_cache_zip,
+                model_name=model_name,
+            )
+        except Exception as e:
+            print(json.dumps({"event": "feature_cache_restore_failed", "key": feature_cache_key, "error": str(e)[:500]}))
+            feature_cache_info = {"used": False, "reason": "restore_error", "files": 0}
 
     # Download dataset from R2
     try:
@@ -1295,23 +1405,8 @@ def handler(job):
     audio_info = probe_audio(dataset_path)
     print(json.dumps({"event": "audio_probe", **audio_info}))
 
-    # Storage optimization: archive dataset as FLAC (lossless, smaller) for long-term storage.
-    if isinstance(dataset_archive_key, str) and dataset_archive_key:
-        try:
-            print(json.dumps({"event": "dataset_archive_start", "key": dataset_archive_key}))
-            ffmpeg_convert_to_flac(dataset_path, dataset_flac_path)
-            client.upload_file(str(dataset_flac_path), bucket, dataset_archive_key)
-            print(
-                json.dumps(
-                    {
-                        "event": "dataset_archive_done",
-                        "archiveBytes": dataset_flac_path.stat().st_size,
-                    }
-                )
-            )
-        except Exception as e:
-            # Don't block training if archiving fails; we can retry on next run.
-            print(json.dumps({"event": "dataset_archive_failed", "error": str(e)[:500]}))
+    # Defer dataset FLAC archiving until after training artifact is uploaded.
+    # This keeps training startup path focused on clone-critical steps.
 
     if PREREQ_MARKER.exists():
         print(json.dumps({"event": "applio_prerequisites_skip", "reason": "baked_into_image"}))
@@ -1342,92 +1437,136 @@ def handler(job):
     if cpu_cores != cpu_cores_raw:
         print(json.dumps({"event": "cpu_cores_clamped", "raw": cpu_cores_raw, "using": cpu_cores}))
 
-    print(json.dumps({"event": "preprocess_start"}))
-    preprocess_cmd = [
-        "python",
-        "core.py",
-        "preprocess",
-        "--model_name",
-        model_name,
-        "--dataset_path",
-        str(dataset_dir),
-        "--sample_rate",
-        str(sr),
-        "--cpu_cores",
-        str(cpu_cores),
-        "--cut_preprocess",
-        str(cut_preprocess),
-        "--chunk_len",
-        str(chunk_len),
-        "--overlap_len",
-        str(overlap_len),
-        "--normalization_mode",
-        str(normalization_mode),
-    ]
-
-    # Preprocess flags are version-dependent; only pass if supported by this Applio build.
-    preprocess_flags = []
-
-    # Applio UI: "Noise filter" == process_effects
-    if core_supports_flag("preprocess", "--process_effects"):
-        preprocess_cmd += ["--process_effects", str(FORCE_PROCESS_EFFECTS)]
-        preprocess_flags.append("process_effects")
+    if feature_cache_info.get("used"):
+        print(
+            json.dumps(
+                {
+                    "event": "feature_cache_used",
+                    "key": feature_cache_key,
+                    "reason": feature_cache_info.get("reason"),
+                    "files": feature_cache_info.get("files"),
+                }
+            )
+        )
     else:
-        print(json.dumps({"event": "preprocess_warn", "missingFlag": "--process_effects"}))
-
-    if core_supports_flag("preprocess", "--noise_reduction"):
-        preprocess_cmd += ["--noise_reduction", str(FORCE_NOISE_REDUCTION)]
-        preprocess_flags.append("noise_reduction")
-    if core_supports_flag("preprocess", "--noise_reduction_strength"):
-        # Keep a reasonable default even though noise reduction is off.
-        preprocess_cmd += ["--noise_reduction_strength", "0.7"]
-        preprocess_flags.append("noise_reduction_strength")
-
-    print(json.dumps({"event": "preprocess_flags", "flags": preprocess_flags}))
-    run(preprocess_cmd, cwd=str(APPLIO_DIR))
-    print(json.dumps({"event": "preprocess_done"}))
-
-    print(json.dumps({"event": "extract_start"}))
-    run(
-        [
+        print(json.dumps({"event": "preprocess_start"}))
+        preprocess_cmd = [
             "python",
             "core.py",
-            "extract",
+            "preprocess",
             "--model_name",
             model_name,
-            "--f0_method",
-            f0_method,
+            "--dataset_path",
+            str(dataset_dir),
             "--sample_rate",
             str(sr),
             "--cpu_cores",
             str(cpu_cores),
-            "--gpu",
-            "0",
-            "--embedder_model",
-            embedder_model,
-            "--embedder_model_custom",
-            "",
-            "--include_mutes",
-            str(include_mutes),
-        ],
-        cwd=str(APPLIO_DIR),
-    )
-    print(json.dumps({"event": "extract_done"}))
+            "--cut_preprocess",
+            str(cut_preprocess),
+            "--chunk_len",
+            str(chunk_len),
+            "--overlap_len",
+            str(overlap_len),
+            "--normalization_mode",
+            str(normalization_mode),
+        ]
 
-    print(json.dumps({"event": "index_start"}))
-    run(
-        [
-            "python",
-            "core.py",
-            "index",
-            "--model_name",
-            model_name,
-            "--index_algorithm",
-            index_algorithm,
-        ],
-        cwd=str(APPLIO_DIR),
-    )
-    print(json.dumps({"event": "index_done"}))
+        # Preprocess flags are version-dependent; only pass if supported by this Applio build.
+        preprocess_flags = []
+
+        # Applio UI: "Noise filter" == process_effects
+        if core_supports_flag("preprocess", "--process_effects"):
+            preprocess_cmd += ["--process_effects", str(FORCE_PROCESS_EFFECTS)]
+            preprocess_flags.append("process_effects")
+        else:
+            print(json.dumps({"event": "preprocess_warn", "missingFlag": "--process_effects"}))
+
+        if core_supports_flag("preprocess", "--noise_reduction"):
+            preprocess_cmd += ["--noise_reduction", str(FORCE_NOISE_REDUCTION)]
+            preprocess_flags.append("noise_reduction")
+        if core_supports_flag("preprocess", "--noise_reduction_strength"):
+            # Keep a reasonable default even though noise reduction is off.
+            preprocess_cmd += ["--noise_reduction_strength", "0.7"]
+            preprocess_flags.append("noise_reduction_strength")
+
+        print(json.dumps({"event": "preprocess_flags", "flags": preprocess_flags}))
+        run(preprocess_cmd, cwd=str(APPLIO_DIR))
+        print(json.dumps({"event": "preprocess_done"}))
+
+        print(json.dumps({"event": "extract_start"}))
+        run(
+            [
+                "python",
+                "core.py",
+                "extract",
+                "--model_name",
+                model_name,
+                "--f0_method",
+                f0_method,
+                "--sample_rate",
+                str(sr),
+                "--cpu_cores",
+                str(cpu_cores),
+                "--gpu",
+                "0",
+                "--embedder_model",
+                embedder_model,
+                "--embedder_model_custom",
+                "",
+                "--include_mutes",
+                str(include_mutes),
+            ],
+            cwd=str(APPLIO_DIR),
+        )
+        print(json.dumps({"event": "extract_done"}))
+
+        print(json.dumps({"event": "index_start"}))
+        run(
+            [
+                "python",
+                "core.py",
+                "index",
+                "--model_name",
+                model_name,
+                "--index_algorithm",
+                index_algorithm,
+            ],
+            cwd=str(APPLIO_DIR),
+        )
+        print(json.dumps({"event": "index_done"}))
+
+        if feature_cache_key and upload_feature_cache:
+            try:
+                feature_cache_bundle = create_feature_cache_archive(model_name, feature_cache_zip)
+                if feature_cache_bundle:
+                    print(
+                        json.dumps(
+                            {
+                                "event": "feature_cache_upload_start",
+                                "key": feature_cache_key,
+                                "bytes": feature_cache_bundle["bytes"],
+                                "files": feature_cache_bundle["files"],
+                            }
+                        )
+                    )
+                    client.upload_file(str(feature_cache_bundle["zip"]), bucket, feature_cache_key)
+                    print(
+                        json.dumps(
+                            {
+                                "event": "feature_cache_upload_done",
+                                "key": feature_cache_key,
+                                "bytes": feature_cache_bundle["bytes"],
+                                "files": feature_cache_bundle["files"],
+                            }
+                        )
+                    )
+                else:
+                    print(json.dumps({"event": "feature_cache_upload_skip", "reason": "no_cache_files"}))
+            except Exception as e:
+                print(json.dumps({"event": "feature_cache_upload_failed", "key": feature_cache_key, "error": str(e)[:500]}))
+        elif feature_cache_key:
+            print(json.dumps({"event": "feature_cache_upload_skip", "reason": "disabled"}))
 
     print(json.dumps({"event": "train_start"}))
     # Keep train flags minimal; unspecified settings follow Applio defaults.
@@ -1514,6 +1653,25 @@ def handler(job):
     except ClientError as e:
         raise RuntimeError(f"Failed to upload to R2: s3://{bucket}/{out_key}\n{e}") from e
 
+    dataset_archive_bytes = None
+    if isinstance(dataset_archive_key, str) and dataset_archive_key:
+        try:
+            print(json.dumps({"event": "dataset_archive_start", "key": dataset_archive_key}))
+            ffmpeg_convert_to_flac(dataset_path, dataset_flac_path)
+            client.upload_file(str(dataset_flac_path), bucket, dataset_archive_key)
+            dataset_archive_bytes = dataset_flac_path.stat().st_size
+            print(
+                json.dumps(
+                    {
+                        "event": "dataset_archive_done",
+                        "archiveBytes": dataset_archive_bytes,
+                    }
+                )
+            )
+        except Exception as e:
+            # Best-effort only. Training artifact already uploaded.
+            print(json.dumps({"event": "dataset_archive_failed", "error": str(e)[:500]}))
+
     return {
         "ok": True,
         "modelName": model_name,
@@ -1530,9 +1688,15 @@ def handler(job):
             "reason": resume_info.get("reason"),
             "files": resume_info.get("files"),
         },
+        "featureCache": {
+            "used": bool(feature_cache_info.get("used")),
+            "reason": feature_cache_info.get("reason"),
+            "files": feature_cache_info.get("files"),
+            "key": feature_cache_key,
+        },
         "checkpoint": checkpoint_upload,
         "datasetArchiveKey": dataset_archive_key,
-        "datasetArchiveBytes": dataset_flac_path.stat().st_size if dataset_flac_path.exists() else None,
+        "datasetArchiveBytes": dataset_archive_bytes,
     }
 
 
