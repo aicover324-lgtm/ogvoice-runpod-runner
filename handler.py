@@ -4,6 +4,8 @@ import shutil
 import subprocess
 import zipfile
 import time
+import re
+from collections import deque
 from pathlib import Path
 from urllib.request import Request, urlopen
 
@@ -56,6 +58,13 @@ FORCE_INCLUDE_MUTES = 2
 FORCE_BATCH_SIZE = 4
 FORCE_INDEX_ALGORITHM = "Auto"
 FORCE_TRAINING_PRECISION = os.environ.get("APPLIO_PRECISION", "bf16").strip().lower()
+
+EPOCH_PATTERNS = [
+    re.compile(r"(?i)\bepoch\s*[:\[\(]?\s*(\d+)\s*(?:/|of)\s*(\d+)"),
+    re.compile(r"(?i)\[(\d+)\s*/\s*(\d+)\]"),
+    re.compile(r"(?i)\bepoch\s*=\s*(\d+)\b"),
+]
+TRAINING_SPEED_PATTERN = re.compile(r"(?i)training_speed\s*=\s*(\d{1,2}:\d{2}:\d{2})")
 
 # "Noise filter" in Applio UI maps to the preprocess flag `--process_effects`.
 # This applies a simple filter during preprocessing.
@@ -193,6 +202,116 @@ def run(cmd, cwd=None):
         tail = (p.stdout or "")[-8000:]
         raise RuntimeError(f"Command failed ({p.returncode}): {' '.join(cmd)}\n\n{tail}")
     return p.stdout or ""
+
+
+def run_stream(cmd, cwd=None, on_line=None):
+    process = subprocess.Popen(
+        cmd,
+        cwd=cwd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+    )
+
+    tail = deque(maxlen=1200)
+    if process.stdout is not None:
+        for raw_line in iter(process.stdout.readline, ""):
+            line = raw_line.rstrip("\n")
+            if line:
+                print(line)
+                tail.append(line)
+                if on_line is not None:
+                    try:
+                        on_line(line)
+                    except Exception:
+                        pass
+        process.stdout.close()
+
+    process.wait()
+    if process.returncode != 0:
+        tail_text = "\n".join(tail)[-8000:]
+        raise RuntimeError(f"Command failed ({process.returncode}): {' '.join(cmd)}\n\n{tail_text}")
+
+
+def extract_epoch_progress(line, total_epoch):
+    if not line:
+        return None
+    text = str(line)
+
+    for pattern in EPOCH_PATTERNS:
+        match = pattern.search(text)
+        if not match:
+            continue
+
+        try:
+            current = int(match.group(1))
+        except Exception:
+            continue
+
+        total = None
+        if match.lastindex and match.lastindex >= 2:
+            try:
+                total = int(match.group(2))
+            except Exception:
+                total = None
+
+        if total_epoch > 0 and total is not None and total != total_epoch:
+            # Prefer exact total-epoch matches for this job when total is present.
+            continue
+        if current < 1:
+            continue
+        if total_epoch > 0 and current > total_epoch:
+            continue
+        return current
+
+    return None
+
+
+def extract_training_speed_seconds(line):
+    if not line:
+        return None
+    match = TRAINING_SPEED_PATTERN.search(str(line))
+    if not match:
+        return None
+    token = match.group(1)
+    parts = token.split(":")
+    if len(parts) != 3:
+        return None
+    try:
+        h = int(parts[0])
+        m = int(parts[1])
+        s = int(parts[2])
+    except Exception:
+        return None
+    if h < 0 or m < 0 or m > 59 or s < 0 or s > 59:
+        return None
+    return h * 3600 + m * 60 + s
+
+
+def upload_training_progress(client, bucket, progress_key, payload):
+    if not progress_key:
+        return
+
+    try:
+        body = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+        client.put_object(
+            Bucket=bucket,
+            Key=progress_key,
+            Body=body,
+            ContentType="application/json",
+            CacheControl="no-store",
+        )
+    except Exception as e:
+        print(
+            json.dumps(
+                {
+                    "event": "training_progress_upload_failed",
+                    "key": progress_key,
+                    "error": str(e)[:300],
+                }
+            )
+        )
 
 
 def get_gpu_diagnostics():
@@ -1274,6 +1393,9 @@ def handler(job):
 
     dataset_key = inp["datasetKey"]
     out_key = inp["outKey"]
+    progress_key = inp.get("progressKey")
+    if not isinstance(progress_key, str) or not progress_key:
+        progress_key = None
     dataset_archive_key = inp.get("datasetArchiveKey")
     checkpoint_key = inp.get("checkpointKey")
     if not isinstance(checkpoint_key, str) or not checkpoint_key:
@@ -1335,6 +1457,7 @@ def handler(job):
                 "modelName": model_name,
                 "datasetKey": dataset_key,
                 "outKey": out_key,
+                "progressKey": progress_key,
                 "sampleRate": sr_tag,
                 "sr": sr,
                 "totalEpoch": total_epoch,
@@ -1661,12 +1784,142 @@ def handler(job):
         "--vocoder",
         vocoder,
     ]
+
+    train_started_at = time.time()
+    last_epoch_seen = 0
+    last_epoch_timestamp = None
+    epoch_durations = []
+    steady_epoch_seconds = None
+    first_epoch_seconds = None
+
+    upload_training_progress(
+        client,
+        bucket,
+        progress_key,
+        {
+            "version": 1,
+            "status": "running",
+            "phase": "training",
+            "totalEpoch": total_epoch,
+            "currentEpoch": 0,
+            "progressPercent": 0,
+            "elapsedSeconds": 0,
+            "etaSeconds": None,
+            "epochSecondsEstimate": None,
+            "firstEpochSeconds": None,
+            "updatedAt": int(train_started_at),
+        },
+    )
+
+    def on_train_line(line):
+        nonlocal last_epoch_seen, last_epoch_timestamp, steady_epoch_seconds, first_epoch_seconds
+
+        epoch = extract_epoch_progress(line, total_epoch)
+        if epoch is None or epoch <= last_epoch_seen:
+            return
+
+        now_ts = time.time()
+
+        epoch_seconds = extract_training_speed_seconds(line)
+        if epoch_seconds is None and last_epoch_timestamp is not None:
+            epoch_seconds = max(0.001, now_ts - last_epoch_timestamp)
+
+        if epoch_seconds is not None:
+            epoch_durations.append(float(epoch_seconds))
+            if epoch == 1 and first_epoch_seconds is None:
+                first_epoch_seconds = float(epoch_seconds)
+
+        last_epoch_timestamp = now_ts
+        last_epoch_seen = epoch
+
+        stable_slice = epoch_durations[1:] if len(epoch_durations) >= 2 else []
+
+        if len(stable_slice) > 0:
+            steady_epoch_seconds = sum(stable_slice) / len(stable_slice)
+
+        eta_seconds = None
+        if steady_epoch_seconds is not None:
+            remaining_epochs = max(0, total_epoch - epoch)
+            eta_seconds = int(round(remaining_epochs * steady_epoch_seconds))
+
+        progress_percent = int(max(1, min(99, round((epoch / max(1, total_epoch)) * 100))))
+
+        upload_training_progress(
+            client,
+            bucket,
+            progress_key,
+            {
+                "version": 1,
+                "status": "running",
+                "phase": "training",
+                "totalEpoch": total_epoch,
+                "currentEpoch": epoch,
+                "progressPercent": progress_percent,
+                "elapsedSeconds": int(max(0, now_ts - train_started_at)),
+                "etaSeconds": eta_seconds,
+                "epochSecondsEstimate": round(steady_epoch_seconds, 3) if steady_epoch_seconds is not None else None,
+                "firstEpochSeconds": round(first_epoch_seconds, 3) if first_epoch_seconds is not None else None,
+                "updatedAt": int(now_ts),
+            },
+        )
+
+        print(
+            json.dumps(
+                {
+                    "event": "training_epoch_progress",
+                    "epoch": epoch,
+                    "totalEpoch": total_epoch,
+                    "etaSeconds": eta_seconds,
+                    "epochSecondsEstimate": round(steady_epoch_seconds, 3) if steady_epoch_seconds is not None else None,
+                }
+            )
+        )
+
     train_error = None
     try:
-        run(train_cmd, cwd=str(APPLIO_DIR))
+        run_stream(train_cmd, cwd=str(APPLIO_DIR), on_line=on_train_line)
+        done_at = time.time()
+        upload_training_progress(
+            client,
+            bucket,
+            progress_key,
+            {
+                "version": 1,
+                "status": "succeeded",
+                "phase": "training",
+                "totalEpoch": total_epoch,
+                "currentEpoch": total_epoch,
+                "progressPercent": 100,
+                "elapsedSeconds": int(max(0, done_at - train_started_at)),
+                "etaSeconds": 0,
+                "epochSecondsEstimate": round(steady_epoch_seconds, 3) if steady_epoch_seconds is not None else None,
+                "firstEpochSeconds": round(first_epoch_seconds, 3) if first_epoch_seconds is not None else None,
+                "updatedAt": int(done_at),
+            },
+        )
         print(json.dumps({"event": "train_done"}))
     except Exception as e:
         train_error = e
+        failed_at = time.time()
+        upload_training_progress(
+            client,
+            bucket,
+            progress_key,
+            {
+                "version": 1,
+                "status": "failed",
+                "phase": "training",
+                "totalEpoch": total_epoch,
+                "currentEpoch": last_epoch_seen,
+                "progressPercent": int(max(1, min(99, round((last_epoch_seen / max(1, total_epoch)) * 100)))),
+                "elapsedSeconds": int(max(0, failed_at - train_started_at)),
+                "etaSeconds": None,
+                "epochSecondsEstimate": round(steady_epoch_seconds, 3) if steady_epoch_seconds is not None else None,
+                "firstEpochSeconds": round(first_epoch_seconds, 3) if first_epoch_seconds is not None else None,
+                "updatedAt": int(failed_at),
+                "error": str(e)[:240],
+            },
+        )
         print(json.dumps({"event": "train_failed", "error": str(e)[:1000]}))
 
     checkpoint_upload = None
