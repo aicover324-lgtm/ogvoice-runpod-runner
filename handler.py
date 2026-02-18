@@ -55,6 +55,7 @@ FORCE_EMBEDDER_MODEL = "contentvec"
 FORCE_INCLUDE_MUTES = 2
 FORCE_BATCH_SIZE = 4
 FORCE_INDEX_ALGORITHM = "Auto"
+FORCE_TRAINING_PRECISION = os.environ.get("APPLIO_PRECISION", "bf16").strip().lower()
 
 # "Noise filter" in Applio UI maps to the preprocess flag `--process_effects`.
 # This applies a simple filter during preprocessing.
@@ -235,6 +236,65 @@ def get_gpu_diagnostics():
         info["nvidiaSmi"] = None
 
     return info
+
+
+def normalize_precision(value: str) -> str:
+    v = str(value or "").strip().lower()
+    if v in ("fp32", "fp16", "bf16"):
+        return v
+    return "bf16"
+
+
+def resolve_precision(preferred: str) -> tuple[str, str, str | None]:
+    requested = normalize_precision(preferred)
+    if requested == "bf16":
+        bf16_supported = (
+            _TORCH_AVAILABLE
+            and torch is not None
+            and bool(torch.cuda.is_available())
+            and bool(torch.cuda.is_bf16_supported())
+        )
+        if bf16_supported:
+            return requested, "bf16", None
+        fp16_supported = _TORCH_AVAILABLE and torch is not None and bool(torch.cuda.is_available())
+        return requested, "fp16" if fp16_supported else "fp32", "bf16_not_supported"
+
+    if requested == "fp16":
+        fp16_supported = _TORCH_AVAILABLE and torch is not None and bool(torch.cuda.is_available())
+        if fp16_supported:
+            return requested, "fp16", None
+        return requested, "fp32", "fp16_not_supported"
+
+    return requested, "fp32", None
+
+
+def force_applio_precision(preferred: str) -> str:
+    config_path = APPLIO_DIR / "assets" / "config.json"
+    requested, effective, fallback_reason = resolve_precision(preferred)
+
+    cfg = {}
+    if config_path.exists():
+        try:
+            cfg = json.loads(config_path.read_text(encoding="utf-8"))
+        except Exception:
+            cfg = {}
+
+    cfg["precision"] = effective
+    config_path.write_text(json.dumps(cfg, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+    print(
+        json.dumps(
+            {
+                "event": "precision_forced",
+                "requested": requested,
+                "effective": effective,
+                "configPath": str(config_path),
+                "fallbackReason": fallback_reason,
+            }
+        )
+    )
+
+    return effective
 
 
 def ensure_applio():
@@ -1197,6 +1257,7 @@ def handler(job):
 
     ensure_applio()
     validate_forced_sample_rate()
+    effective_precision = force_applio_precision(FORCE_TRAINING_PRECISION)
 
     bucket = require_env("R2_BUCKET")
     inp = (job or {}).get("input") or {}
@@ -1287,6 +1348,7 @@ def handler(job):
                 "embedderModel": embedder_model,
                 "includeMutes": include_mutes,
                 "indexAlgorithm": index_algorithm,
+                "precision": effective_precision,
                 "pretrained": pretrained,
                 "customPretrained": custom_pretrained,
                 "saveOnlyLatest": save_only_latest,
@@ -1683,6 +1745,7 @@ def handler(job):
             "g": str(CUSTOM_PRETRAIN_G_PATH),
             "d": str(CUSTOM_PRETRAIN_D_PATH),
         },
+        "precision": effective_precision,
         "resume": {
             "used": bool(resume_info.get("used")),
             "reason": resume_info.get("reason"),
