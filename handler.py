@@ -82,11 +82,11 @@ FORCE_NOISE_REDUCTION = False
 
 VOCAL_SEP_MODEL = os.environ.get(
     "VOCAL_SEP_MODEL",
-    "Mel-Roformer by KimberleyJSN",
+    "Mel-Roformer Becruily Deux",
 )
 KARAOKE_SEP_MODEL = os.environ.get(
     "KARAOKE_SEP_MODEL",
-    "Mel-Roformer Karaoke by aufr33 and viperx",
+    "BS-Roformer Karaoke by Anvuew",
 )
 
 MUSIC_SEPARATION_DIR = Path("/app/music_separation_code")
@@ -94,28 +94,27 @@ MUSIC_SEPARATION_INFER = MUSIC_SEPARATION_DIR / "inference.py"
 
 STEM_MODEL_SPECS = {
     "vocals": {
-        "id": "mel_vocals",
-        "name": "Mel-Roformer by KimberleyJSN",
+        "id": "mel_vocals_becruily_deux",
+        "name": "Mel-Roformer Becruily Deux",
         "type": "mel_band_roformer",
-        "config_url": "https://raw.githubusercontent.com/ZFTurbo/Music-Source-Separation-Training/main/configs/KimberleyJensen/config_vocals_mel_band_roformer_kj.yaml",
-        "model_url": "https://huggingface.co/KimberleyJSN/melbandroformer/resolve/main/MelBandRoformer.ckpt",
+        "config_url": "https://huggingface.co/OrcunAICovers/stem_seperation/resolve/main/config_deux_becruily.yaml?download=true",
+        "model_url": "https://huggingface.co/OrcunAICovers/stem_seperation/resolve/main/becruily_deux.ckpt?download=true",
         "aliases": (
-            "mel-roformer by kimberleyjsn",
-            "vocals_mel_band_roformer.ckpt",
-            "model_mel_band_roformer_ep_3005_sdr_11.4360.ckpt",
-            "melbandroformer.ckpt",
+            "mel-roformer becruily deux",
+            "becruily_deux.ckpt",
+            "config_deux_becruily.yaml",
         ),
     },
     "karaoke": {
-        "id": "mel_karaoke",
-        "name": "Mel-Roformer Karaoke by aufr33 and viperx",
-        "type": "mel_band_roformer",
-        "config_url": "https://huggingface.co/shiromiya/audio-separation-models/resolve/main/mel_band_roformer_karaoke_aufr33_viperx/config_mel_band_roformer_karaoke.yaml",
-        "model_url": "https://huggingface.co/shiromiya/audio-separation-models/resolve/main/mel_band_roformer_karaoke_aufr33_viperx/mel_band_roformer_karaoke_aufr33_viperx_sdr_10.1956.ckpt",
+        "id": "karaoke_bs_roformer_anvuew",
+        "name": "BS-Roformer Karaoke by Anvuew",
+        "type": "bs_roformer",
+        "config_url": "https://huggingface.co/OrcunAICovers/stem_seperation/resolve/main/karaoke_bs_roformer_anvuew.yaml?download=true",
+        "model_url": "https://huggingface.co/OrcunAICovers/stem_seperation/resolve/main/karaoke_bs_roformer_anvuew.ckpt?download=true",
         "aliases": (
-            "mel-roformer karaoke by aufr33 and viperx",
-            "mel_band_roformer_karaoke_aufr33_viperx_sdr_10.1956.ckpt",
-            "uvr_mdxnet_kara_2.onnx",
+            "bs-roformer karaoke by anvuew",
+            "karaoke_bs_roformer_anvuew.ckpt",
+            "karaoke_bs_roformer_anvuew.yaml",
         ),
     },
 }
@@ -1371,7 +1370,7 @@ def handle_infer_job(job, inp, bucket: str, client):
 
 
 def handler(job):
-    print(json.dumps({"event": "runner_build", "build": "stemflow-20260216-2"}))
+    print(json.dumps({"event": "runner_build", "build": "stemflow-20260219-becruily-anvuew"}))
     log_runtime_dependency_info()
 
     ensure_applio()
