@@ -57,7 +57,8 @@ FORCE_EMBEDDER_MODEL = "contentvec"
 FORCE_INCLUDE_MUTES = 2
 FORCE_BATCH_SIZE = 4
 FORCE_INDEX_ALGORITHM = "Auto"
-FORCE_TRAINING_PRECISION = os.environ.get("APPLIO_PRECISION", "bf16").strip().lower()
+FORCE_TRAINING_PRECISION = os.environ.get("APPLIO_TRAIN_PRECISION", "bf16").strip().lower()
+FORCE_INFER_PRECISION = os.environ.get("APPLIO_INFER_PRECISION", "fp16").strip().lower()
 
 EPOCH_PATTERNS = [
     re.compile(r"(?i)\bepoch\s*[:\[\(]?\s*(\d+)\s*(?:/|of)\s*(\d+)"),
@@ -1149,7 +1150,7 @@ def stem_key_from_out_key(out_key: str, stem_name: str):
     return f"{base}__{stem_name}.wav"
 
 
-def handle_infer_job(job, inp, bucket: str, client):
+def handle_infer_job(job, inp, bucket: str, client, effective_precision: str):
     if "modelKey" not in inp:
         raise RuntimeError("Missing required input: modelKey")
     if "inputKey" not in inp:
@@ -1242,6 +1243,7 @@ def handle_infer_job(job, inp, bucket: str, client):
                 "mixWithInput": mix_with_input,
                 "vocalSepModel": vocal_sep_model,
                 "karaokeSepModel": karaoke_sep_model,
+                "precision": effective_precision,
                 "stemTimeoutSec": INFER_STEM_TIMEOUT_SEC,
                 "inferTimeoutSec": INFER_RVC_TIMEOUT_SEC,
                 "mixTimeoutSec": INFER_MIX_TIMEOUT_SEC,
@@ -1396,6 +1398,7 @@ def handle_infer_job(job, inp, bucket: str, client):
         "searchFeatureRatio": index_rate,
         "splitAudio": split_audio,
         "exportFormat": export_format,
+        "precision": effective_precision,
         "addBackVocals": add_back_vocals,
         "convertBackVocals": convert_back_vocals,
         "mixedWithInput": mix_with_input,
@@ -1414,15 +1417,27 @@ def handler(job):
 
     ensure_applio()
     validate_forced_sample_rate()
-    effective_precision = force_applio_precision(FORCE_TRAINING_PRECISION)
 
     bucket = require_env("R2_BUCKET")
     inp = (job or {}).get("input") or {}
     mode = str(inp.get("mode") or "train").strip().lower()
+    preferred_precision = FORCE_INFER_PRECISION if mode == "infer" else FORCE_TRAINING_PRECISION
+    effective_precision = force_applio_precision(preferred_precision)
+    if effective_precision != preferred_precision:
+        raise RuntimeError(
+            f"Precision requirement mismatch for mode={mode}: "
+            f"requested={preferred_precision}, effective={effective_precision}"
+        )
     client = s3()
 
     if mode == "infer":
-        return handle_infer_job(job=job, inp=inp, bucket=bucket, client=client)
+        return handle_infer_job(
+            job=job,
+            inp=inp,
+            bucket=bucket,
+            client=client,
+            effective_precision=effective_precision,
+        )
 
     if "datasetKey" not in inp:
         raise RuntimeError("Missing required input: datasetKey")
