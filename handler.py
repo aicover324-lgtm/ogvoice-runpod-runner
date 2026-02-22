@@ -1494,61 +1494,27 @@ def ensure_bs_roformer_runtime_compat():
 
     try:
         text = bs_file.read_text(encoding="utf-8")
-        original = text
-
-        sig_old = (
-            "            mask_estimator_depth=2,\n"
-            "            multi_stft_resolution_loss_weight=1.,\n"
-        )
-        sig_new = (
-            "            mask_estimator_depth=2,\n"
-            "            mlp_expansion_factor=4,\n"
-            "            multi_stft_resolution_loss_weight=1.,\n"
-        )
-
-        block_old = (
-            "            mask_estimator = MaskEstimator(\n"
-            "                dim=dim,\n"
-            "                dim_inputs=freqs_per_bands_with_complex,\n"
-            "                depth=mask_estimator_depth\n"
-            "            )\n"
-        )
-        block_new = (
-            "            mask_estimator = MaskEstimator(\n"
-            "                dim=dim,\n"
-            "                dim_inputs=freqs_per_bands_with_complex,\n"
-            "                depth=mask_estimator_depth,\n"
-            "                mlp_expansion_factor=mlp_expansion_factor,\n"
-            "            )\n"
-        )
-
         changed = False
-        if "mlp_expansion_factor=4" not in text and sig_old in text:
-            text = text.replace(sig_old, sig_new, 1)
+
+        # Repair broken partial patch state that causes:
+        # NameError: name 'mlp_expansion_factor' is not defined
+        # Safe in all variants because MaskEstimator already has default=4.
+        bad_line = "                mlp_expansion_factor=mlp_expansion_factor,\n"
+        if bad_line in text:
+            text = text.replace(bad_line, "", 1)
             changed = True
 
-        if "mlp_expansion_factor=mlp_expansion_factor" not in text and block_old in text:
-            text = text.replace(block_old, block_new, 1)
+        # Also remove accidental tab-indented variant if present.
+        bad_line_tab = "\t\t\t\tmlp_expansion_factor=mlp_expansion_factor,\n"
+        if bad_line_tab in text:
+            text = text.replace(bad_line_tab, "", 1)
             changed = True
 
         if changed:
             bs_file.write_text(text, encoding="utf-8")
-            print(json.dumps({"event": "stem_bs_roformer_patch_applied", "path": str(bs_file)}))
+            print(json.dumps({"event": "stem_bs_roformer_patch_applied", "path": str(bs_file), "mode": "repair_nameerror"}))
         else:
             print(json.dumps({"event": "stem_bs_roformer_patch_ok", "path": str(bs_file)}))
-
-        if (
-            "mlp_expansion_factor=4" not in text
-            or "mlp_expansion_factor=mlp_expansion_factor" not in text
-        ):
-            print(
-                json.dumps(
-                    {
-                        "event": "stem_bs_roformer_patch_incomplete",
-                        "path": str(bs_file),
-                    }
-                )
-            )
     except Exception as e:
         print(
             json.dumps(
@@ -2416,7 +2382,7 @@ def handle_infer_job(job, inp, bucket: str, client, effective_precision: str):
 
 
 def handler(job):
-    print(json.dumps({"event": "runner_build", "build": "stemflow-20260223-chainfix-uvr-karaoke-v3"}))
+    print(json.dumps({"event": "runner_build", "build": "stemflow-20260223-chainfix-uvr-karaoke-v4"}))
     log_runtime_dependency_info()
 
     ensure_applio()
