@@ -109,6 +109,8 @@ INFER_MIX_TIMEOUT_SEC = env_int("INFER_MIX_TIMEOUT_SEC", 600)
 INFER_SPLIT_AUDIO_FORCE_AT_SECONDS = env_int("INFER_SPLIT_AUDIO_FORCE_AT_SECONDS", 210, minimum=0)
 INFER_MODEL_CACHE_DIR = WORK_DIR / "model_cache"
 INFER_MODEL_CACHE_MAX_ENTRIES = env_int("INFER_MODEL_CACHE_MAX_ENTRIES", 24)
+_STEM_CACHE_PREFIX_RAW = os.environ.get("INFER_STEM_CACHE_PREFIX", "cache/stems/v1")
+INFER_STEM_CACHE_PREFIX = _STEM_CACHE_PREFIX_RAW.strip().strip("/") or "cache/stems/v1"
 
 MUSIC_SEPARATION_DIR = Path("/app/music_separation_code")
 MUSIC_SEPARATION_INFER = MUSIC_SEPARATION_DIR / "inference.py"
@@ -164,6 +166,8 @@ def as_bool(v, default=False) -> bool:
 
 
 INFER_STEM_OUTPUT_FLAC = as_bool(os.environ.get("INFER_STEM_OUTPUT_FLAC"), False)
+INFER_STEM_CACHE_ENABLED = as_bool(os.environ.get("INFER_STEM_CACHE_ENABLED"), True)
+INFER_STEM_CACHE_UPLOAD_ENABLED = as_bool(os.environ.get("INFER_STEM_CACHE_UPLOAD_ENABLED"), True)
 
 
 def as_int(v, default: int) -> int:
@@ -993,6 +997,210 @@ def resolve_infer_model_files(*, client, bucket: str, model_key: str, work: Path
     }
 
 
+def sha1_file_hex(path: Path, chunk_bytes: int = 2 * 1024 * 1024) -> str:
+    h = hashlib.sha1()
+    with open(path, "rb") as f:
+        while True:
+            chunk = f.read(chunk_bytes)
+            if not chunk:
+                break
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def user_scope_from_input_key(input_key: str) -> str:
+    text = str(input_key or "")
+    m = re.match(r"^u/([^/]+)/", text)
+    if not m:
+        return "global"
+    scope = re.sub(r"[^a-zA-Z0-9_-]", "-", m.group(1).strip())
+    return scope or "global"
+
+
+def build_main_stem_cache_prefix(input_sha1: str, model_id: str, user_scope: str) -> str:
+    model_slug = re.sub(r"[^a-z0-9_-]", "-", str(model_id or "").strip().lower())
+    if not model_slug:
+        model_slug = "default"
+    key_hash = str(input_sha1 or "").strip().lower()
+    if not key_hash:
+        key_hash = "unknown"
+    scope = re.sub(r"[^a-zA-Z0-9_-]", "-", str(user_scope or "").strip()) or "global"
+    return f"{INFER_STEM_CACHE_PREFIX}/main/{scope}/{model_slug}/{key_hash}"
+
+
+def _s3_download_if_exists(client, bucket: str, key: str, dest: Path) -> bool:
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    if dest.exists():
+        dest.unlink()
+
+    try:
+        client.download_file(bucket, key, str(dest))
+    except ClientError as e:
+        code = _client_error_code(e)
+        if code in ("404", "NoSuchKey", "NotFound"):
+            return False
+        raise
+
+    return _file_ready(dest, 1000)
+
+
+def _s3_json_if_exists(client, bucket: str, key: str):
+    try:
+        obj = client.get_object(Bucket=bucket, Key=key)
+    except ClientError as e:
+        code = _client_error_code(e)
+        if code in ("404", "NoSuchKey", "NotFound"):
+            return None
+        raise
+
+    try:
+        body = obj["Body"].read()
+        if not body:
+            return None
+        return json.loads(body.decode("utf-8"))
+    except Exception:
+        return None
+
+
+def restore_main_stem_cache_if_exists(client, bucket: str, cache_prefix: str, dest_dir: Path):
+    meta_key = f"{cache_prefix}/meta.json"
+    print(json.dumps({"event": "stem_cache_main_lookup_start", "prefix": cache_prefix}))
+
+    meta = _s3_json_if_exists(client, bucket, meta_key)
+    name_pairs = []
+    if isinstance(meta, dict):
+        vocals_name = str(meta.get("vocalsName") or "").strip()
+        inst_name = str(meta.get("instrumentalName") or "").strip()
+        if vocals_name and inst_name:
+            name_pairs.append((vocals_name, inst_name))
+
+    name_pairs.extend(
+        [
+            ("vocals.wav", "instrumental.wav"),
+            ("vocals.flac", "instrumental.flac"),
+        ]
+    )
+
+    seen = set()
+    dedup_pairs = []
+    for vocals_name, inst_name in name_pairs:
+        pair = (vocals_name, inst_name)
+        if pair in seen:
+            continue
+        seen.add(pair)
+        dedup_pairs.append(pair)
+
+    dest_dir.mkdir(parents=True, exist_ok=True)
+
+    for vocals_name, inst_name in dedup_pairs:
+        if "/" in vocals_name or "\\" in vocals_name:
+            continue
+        if "/" in inst_name or "\\" in inst_name:
+            continue
+
+        vocals_key = f"{cache_prefix}/{vocals_name}"
+        inst_key = f"{cache_prefix}/{inst_name}"
+        vocals_path = dest_dir / vocals_name
+        inst_path = dest_dir / inst_name
+
+        ok_vocals = _s3_download_if_exists(client, bucket, vocals_key, vocals_path)
+        ok_inst = _s3_download_if_exists(client, bucket, inst_key, inst_path)
+        if ok_vocals and ok_inst and _file_ready(vocals_path, 1000) and _file_ready(inst_path, 1000):
+            print(
+                json.dumps(
+                    {
+                        "event": "stem_cache_main_lookup_done",
+                        "prefix": cache_prefix,
+                        "used": True,
+                        "vocalsKey": vocals_key,
+                        "instrumentalKey": inst_key,
+                        "vocalsBytes": vocals_path.stat().st_size,
+                        "instrumentalBytes": inst_path.stat().st_size,
+                    }
+                )
+            )
+            return {
+                "used": True,
+                "vocals": vocals_path,
+                "instrumental": inst_path,
+                "vocalsKey": vocals_key,
+                "instrumentalKey": inst_key,
+            }
+
+        for p in (vocals_path, inst_path):
+            try:
+                if p.exists():
+                    p.unlink()
+            except Exception:
+                pass
+
+    print(json.dumps({"event": "stem_cache_main_lookup_done", "prefix": cache_prefix, "used": False}))
+    return {"used": False, "vocals": None, "instrumental": None, "vocalsKey": None, "instrumentalKey": None}
+
+
+def upload_main_stem_cache_best_effort(
+    client,
+    bucket: str,
+    cache_prefix: str,
+    vocals_path: Path,
+    instrumental_path: Path,
+    meta: dict,
+):
+    if not INFER_STEM_CACHE_UPLOAD_ENABLED:
+        print(json.dumps({"event": "stem_cache_main_upload_skip", "reason": "disabled", "prefix": cache_prefix}))
+        return {"uploaded": False, "reason": "disabled"}
+
+    try:
+        def safe_suffix(path: Path) -> str:
+            suffix = str(path.suffix or "").strip().lower()
+            if re.fullmatch(r"\.[a-z0-9]+", suffix):
+                return suffix
+            return ".wav"
+
+        started = time.time()
+        vocals_name = f"vocals{safe_suffix(vocals_path)}"
+        instrumental_name = f"instrumental{safe_suffix(instrumental_path)}"
+        vocals_key = f"{cache_prefix}/{vocals_name}"
+        inst_key = f"{cache_prefix}/{instrumental_name}"
+
+        print(json.dumps({"event": "stem_cache_main_upload_start", "prefix": cache_prefix}))
+        client.upload_file(str(vocals_path), bucket, vocals_key)
+        client.upload_file(str(instrumental_path), bucket, inst_key)
+
+        payload = {
+            "version": 1,
+            "createdAt": int(time.time()),
+            "vocalsName": vocals_name,
+            "instrumentalName": instrumental_name,
+            "vocalsKey": vocals_key,
+            "instrumentalKey": inst_key,
+            "vocalsBytes": vocals_path.stat().st_size,
+            "instrumentalBytes": instrumental_path.stat().st_size,
+            "meta": meta,
+        }
+        client.put_object(
+            Bucket=bucket,
+            Key=f"{cache_prefix}/meta.json",
+            Body=json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8"),
+            ContentType="application/json",
+            CacheControl="no-store",
+        )
+
+        print(
+            json.dumps(
+                {
+                    "event": "stem_cache_main_upload_done",
+                    "prefix": cache_prefix,
+                    "durationSec": round(max(0.0, time.time() - started), 3),
+                }
+            )
+        )
+        return {"uploaded": True, "vocalsKey": vocals_key, "instrumentalKey": inst_key}
+    except Exception as e:
+        print(json.dumps({"event": "stem_cache_main_upload_failed", "prefix": cache_prefix, "error": str(e)[:500]}))
+        return {"uploaded": False, "reason": "error"}
+
+
 def separate_vocals_and_instrumental(
     *,
     input_audio: Path,
@@ -1200,6 +1408,63 @@ def run_rvc_infer_file(
     return result_path
 
 
+def _build_atempo_chain(target: float):
+    # ffmpeg atempo only supports [0.5, 2.0]; chain multiple filters when needed.
+    if target <= 0:
+        return [1.0]
+
+    factors = []
+    remain = float(target)
+    while remain < 0.5:
+        factors.append(0.5)
+        remain /= 0.5
+    while remain > 2.0:
+        factors.append(2.0)
+        remain /= 2.0
+
+    if not factors or abs(remain - 1.0) > 1e-6:
+        factors.append(remain)
+    return factors
+
+
+def pitch_shift_audio_preserve_duration(*, src_path: Path, out_path: Path, semitones: int):
+    if semitones == 0:
+        return src_path
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    if out_path.exists():
+        out_path.unlink()
+
+    pitch_factor = 2 ** (float(semitones) / 12.0)
+    tempo_target = 1.0 / pitch_factor
+    atempo_chain = ",".join([f"atempo={f:.8f}" for f in _build_atempo_chain(tempo_target)])
+    filter_chain = f"asetrate=44100*{pitch_factor:.10f},{atempo_chain},aresample=44100"
+
+    run(
+        [
+            "ffmpeg",
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-i",
+            str(src_path),
+            "-filter:a",
+            filter_chain,
+            "-ar",
+            "44100",
+            "-ac",
+            "2",
+            str(out_path),
+        ],
+        timeout_sec=INFER_MIX_TIMEOUT_SEC,
+    )
+
+    if not out_path.exists() or out_path.stat().st_size == 0:
+        raise RuntimeError("Instrumental pitch shift output is missing.")
+    return out_path
+
+
 def mix_cover_tracks(*, lead_path: Path, inst_path: Path, backing_path: Path | None, out_path: Path, back_volume: float):
     if backing_path is None:
         filter_graph = "[0:a]volume=1.15[lead];[1:a]volume=0.95[inst];[lead][inst]amix=inputs=2:weights='1 1':normalize=0:dropout_transition=0[mix]"
@@ -1299,8 +1564,14 @@ def handle_infer_job(job, inp, bucket: str, client, effective_precision: str):
     if pitch > 24:
         pitch = 24
 
+    instrumental_pitch = as_int(inp.get("instrumentalPitch"), pitch)
+    if instrumental_pitch < -24:
+        instrumental_pitch = -24
+    if instrumental_pitch > 24:
+        instrumental_pitch = 24
+
     index_rate = _clamp(as_float(inp.get("searchFeatureRatio"), 0.75), 0.0, 1.0)
-    split_audio = as_bool(inp.get("splitAudio"), False)
+    split_audio = as_bool(inp.get("splitAudio"), True)
 
     protect = _clamp(as_float(inp.get("protect"), 0.33), 0.0, 0.5)
     f0_method = str(inp.get("f0Method") or "rmvpe")
@@ -1363,6 +1634,7 @@ def handle_infer_job(job, inp, bucket: str, client, effective_precision: str):
                 "inputKey": input_key,
                 "outKey": out_key,
                 "pitch": pitch,
+                "instrumentalPitch": instrumental_pitch,
                 "searchFeatureRatio": index_rate,
                 "splitAudio": split_audio,
                 "f0Method": f0_method,
@@ -1375,6 +1647,9 @@ def handle_infer_job(job, inp, bucket: str, client, effective_precision: str):
                 "karaokeSepModel": karaoke_sep_model,
                 "precision": effective_precision,
                 "stemOutputFlac": INFER_STEM_OUTPUT_FLAC,
+                "stemCacheEnabled": INFER_STEM_CACHE_ENABLED,
+                "stemCacheUploadEnabled": INFER_STEM_CACHE_UPLOAD_ENABLED,
+                "stemCachePrefix": INFER_STEM_CACHE_PREFIX,
                 "splitAudioForceAtSeconds": INFER_SPLIT_AUDIO_FORCE_AT_SECONDS,
                 "stemTimeoutSec": INFER_STEM_TIMEOUT_SEC,
                 "inferTimeoutSec": INFER_RVC_TIMEOUT_SEC,
@@ -1441,20 +1716,83 @@ def handle_infer_job(job, inp, bucket: str, client, effective_precision: str):
             )
         )
 
+    input_fingerprint = None
+    input_fingerprint_duration_sec = 0.0
+    main_stem_cache_prefix = None
+    main_stem_cache_status = "disabled"
+    main_cache_lookup_duration_sec = 0.0
+    main_cache_upload_duration_sec = 0.0
+    main_cache_lookup = {"used": False, "vocals": None, "instrumental": None}
+
     stems_root = work / "stems"
-    print(json.dumps({"event": "stem_separation_main_start", "model": vocal_sep_model}))
-    main_sep_started = time.time()
-    main_stems = separate_vocals_and_instrumental(
-        input_audio=input_path,
-        out_dir=stems_root / "main",
-        model_filename=vocal_sep_model,
-        vocals_name="main_vocals",
-        instrumental_name="instrumental",
-    )
-    main_sep_duration_sec = max(0.0, time.time() - main_sep_started)
-    main_model_used = main_stems.get("modelUsed")
-    lead_source = main_stems["vocals"]
-    instrumental_source = main_stems["instrumental"]
+    if INFER_STEM_CACHE_ENABLED:
+        fingerprint_started = time.time()
+        input_fingerprint = sha1_file_hex(input_path)
+        input_fingerprint_duration_sec = max(0.0, time.time() - fingerprint_started)
+        print(
+            json.dumps(
+                {
+                    "event": "infer_input_fingerprint",
+                    "sha1": input_fingerprint,
+                    "durationSec": round(input_fingerprint_duration_sec, 3),
+                }
+            )
+        )
+
+        main_stem_cache_prefix = build_main_stem_cache_prefix(
+            input_sha1=input_fingerprint,
+            model_id=STEM_MODEL_SPECS["vocals"]["id"],
+            user_scope=user_scope_from_input_key(input_key),
+        )
+        main_stem_cache_status = "miss"
+        cache_lookup_started = time.time()
+        main_cache_lookup = restore_main_stem_cache_if_exists(
+            client=client,
+            bucket=bucket,
+            cache_prefix=main_stem_cache_prefix,
+            dest_dir=stems_root / "main_cache",
+        )
+        main_cache_lookup_duration_sec = max(0.0, time.time() - cache_lookup_started)
+        if main_cache_lookup.get("used"):
+            main_stem_cache_status = "hit"
+
+    main_sep_duration_sec = 0.0
+    main_stems = None
+    if main_cache_lookup.get("used"):
+        lead_source = Path(str(main_cache_lookup["vocals"]))
+        instrumental_source = Path(str(main_cache_lookup["instrumental"]))
+        main_model_used = STEM_MODEL_SPECS["vocals"]["name"]
+    else:
+        print(json.dumps({"event": "stem_separation_main_start", "model": vocal_sep_model}))
+        main_sep_started = time.time()
+        main_stems = separate_vocals_and_instrumental(
+            input_audio=input_path,
+            out_dir=stems_root / "main",
+            model_filename=vocal_sep_model,
+            vocals_name="main_vocals",
+            instrumental_name="instrumental",
+        )
+        main_sep_duration_sec = max(0.0, time.time() - main_sep_started)
+        main_model_used = main_stems.get("modelUsed")
+        lead_source = main_stems["vocals"]
+        instrumental_source = main_stems["instrumental"]
+
+        if main_stem_cache_prefix:
+            cache_upload_started = time.time()
+            upload_main_stem_cache_best_effort(
+                client=client,
+                bucket=bucket,
+                cache_prefix=main_stem_cache_prefix,
+                vocals_path=lead_source,
+                instrumental_path=instrumental_source,
+                meta={
+                    "inputKey": input_key,
+                    "model": vocal_sep_model,
+                    "inputDurationSec": input_duration_sec,
+                },
+            )
+            main_cache_upload_duration_sec = max(0.0, time.time() - cache_upload_started)
+
     print(
         json.dumps(
             {
@@ -1463,6 +1801,7 @@ def handle_infer_job(job, inp, bucket: str, client, effective_precision: str):
                 "instrumentalSource": str(instrumental_source),
                 "modelUsed": main_model_used,
                 "durationSec": round(main_sep_duration_sec, 3),
+                "cacheStatus": main_stem_cache_status,
             }
         )
     )
@@ -1555,6 +1894,36 @@ def handle_infer_job(job, inp, bucket: str, client, effective_precision: str):
         else:
             backing_for_mix = backing_source
 
+    instrumental_for_mix = instrumental_source
+    instrumental_pitch_shift_duration_sec = 0.0
+    if mix_with_input and instrumental_pitch != 0:
+        print(
+            json.dumps(
+                {
+                    "event": "instrumental_pitch_shift_start",
+                    "semitones": instrumental_pitch,
+                    "input": str(instrumental_source),
+                }
+            )
+        )
+        shift_started = time.time()
+        shifted_inst_path = work / "instrumental_pitch_shifted.wav"
+        instrumental_for_mix = pitch_shift_audio_preserve_duration(
+            src_path=instrumental_source,
+            out_path=shifted_inst_path,
+            semitones=instrumental_pitch,
+        )
+        instrumental_pitch_shift_duration_sec = max(0.0, time.time() - shift_started)
+        print(
+            json.dumps(
+                {
+                    "event": "instrumental_pitch_shift_done",
+                    "output": str(instrumental_for_mix),
+                    "durationSec": round(instrumental_pitch_shift_duration_sec, 3),
+                }
+            )
+        )
+
     final_path = lead_converted
     mix_duration_sec = 0.0
     if mix_with_input:
@@ -1566,7 +1935,7 @@ def handle_infer_job(job, inp, bucket: str, client, effective_precision: str):
         mix_started = time.time()
         final_path = mix_cover_tracks(
             lead_path=lead_converted,
-            inst_path=instrumental_source,
+            inst_path=instrumental_for_mix,
             backing_path=backing_for_mix if add_back_vocals else None,
             out_path=mix_path,
             back_volume=back_volume,
@@ -1613,6 +1982,7 @@ def handle_infer_job(job, inp, bucket: str, client, effective_precision: str):
         "outputKey": out_key,
         "outputBytes": final_path.stat().st_size,
         "pitch": pitch,
+        "instrumentalPitch": instrumental_pitch,
         "searchFeatureRatio": index_rate,
         "splitAudio": split_audio,
         "exportFormat": export_format,
@@ -1621,14 +1991,24 @@ def handle_infer_job(job, inp, bucket: str, client, effective_precision: str):
         "convertBackVocals": convert_back_vocals,
         "mixedWithInput": mix_with_input,
         "requireGpu": require_gpu,
+        "cache": {
+            "model": model_info.get("cache"),
+            "mainStem": main_stem_cache_status,
+            "mainStemPrefix": main_stem_cache_prefix,
+            "inputSha1": input_fingerprint,
+        },
         "timingsSec": {
             "total": round(total_duration_sec, 3),
             "modelResolve": round(model_resolve_duration_sec, 3),
             "inputDownload": round(input_download_duration_sec, 3),
+            "inputFingerprint": round(input_fingerprint_duration_sec, 3),
+            "mainStemCacheLookup": round(main_cache_lookup_duration_sec, 3),
             "mainStem": round(main_sep_duration_sec, 3),
+            "mainStemCacheUpload": round(main_cache_upload_duration_sec, 3),
             "backingStem": round(backing_sep_duration_sec, 3),
             "mainInfer": round(main_infer_duration_sec, 3),
             "backingInfer": round(backing_infer_duration_sec, 3),
+            "instrumentalPitchShift": round(instrumental_pitch_shift_duration_sec, 3),
             "mix": round(mix_duration_sec, 3),
             "upload": round(upload_duration_sec, 3),
         },
