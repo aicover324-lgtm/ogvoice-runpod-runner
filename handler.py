@@ -2198,10 +2198,25 @@ def handle_infer_job(job, inp, bucket: str, client, effective_precision: str):
         )
     )
 
-    print(json.dumps({"event": "infer_convert_main_start", "input": str(lead_source)}))
+    lead_rvc_input = normalize_audio_to_wav(
+        src_path=lead_source,
+        out_path=work / "lead_for_rvc.wav",
+    )
+    print(
+        json.dumps(
+            {
+                "event": "infer_rvc_input_normalized",
+                "role": "main",
+                "src": str(lead_source),
+                "normalized": str(lead_rvc_input),
+            }
+        )
+    )
+
+    print(json.dumps({"event": "infer_convert_main_start", "input": str(lead_rvc_input)}))
     main_infer_started = time.time()
     lead_converted = run_rvc_infer_file(
-        input_audio=lead_source,
+        input_audio=lead_rvc_input,
         output_wav=output_path,
         model_files=model_files,
         pitch=pitch,
@@ -2230,11 +2245,25 @@ def handle_infer_job(job, inp, bucket: str, client, effective_precision: str):
         if backing_source is None:
             raise RuntimeError("Backing vocal stem is missing.")
         if convert_back_vocals:
-            print(json.dumps({"event": "infer_convert_backing_start", "input": str(backing_source)}))
+            backing_rvc_input = normalize_audio_to_wav(
+                src_path=backing_source,
+                out_path=work / "backing_for_rvc.wav",
+            )
+            print(
+                json.dumps(
+                    {
+                        "event": "infer_rvc_input_normalized",
+                        "role": "backing",
+                        "src": str(backing_source),
+                        "normalized": str(backing_rvc_input),
+                    }
+                )
+            )
+            print(json.dumps({"event": "infer_convert_backing_start", "input": str(backing_rvc_input)}))
             backing_infer_started = time.time()
             backing_output = work / "backing_converted.wav"
             backing_for_mix = run_rvc_infer_file(
-                input_audio=backing_source,
+                input_audio=backing_rvc_input,
                 output_wav=backing_output,
                 model_files=model_files,
                 pitch=pitch,
@@ -2417,7 +2446,7 @@ def handle_infer_job(job, inp, bucket: str, client, effective_precision: str):
 
 
 def handler(job):
-    print(json.dumps({"event": "runner_build", "build": "stemflow-20260223-karaoke-mel-default-v6"}))
+    print(json.dumps({"event": "runner_build", "build": "stemflow-20260223-karaoke-mel-default-v7"}))
     log_runtime_dependency_info()
 
     ensure_applio()
