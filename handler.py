@@ -1,5 +1,6 @@
 import os
 import json
+import hashlib
 import shutil
 import subprocess
 import zipfile
@@ -105,9 +106,15 @@ def env_int(name: str, default: int, minimum: int = 1) -> int:
 INFER_STEM_TIMEOUT_SEC = env_int("INFER_STEM_TIMEOUT_SEC", 1800)
 INFER_RVC_TIMEOUT_SEC = env_int("INFER_RVC_TIMEOUT_SEC", 1500)
 INFER_MIX_TIMEOUT_SEC = env_int("INFER_MIX_TIMEOUT_SEC", 600)
+INFER_SPLIT_AUDIO_FORCE_AT_SECONDS = env_int("INFER_SPLIT_AUDIO_FORCE_AT_SECONDS", 210, minimum=0)
+INFER_MODEL_CACHE_DIR = WORK_DIR / "model_cache"
+INFER_MODEL_CACHE_MAX_ENTRIES = env_int("INFER_MODEL_CACHE_MAX_ENTRIES", 24)
 
 MUSIC_SEPARATION_DIR = Path("/app/music_separation_code")
 MUSIC_SEPARATION_INFER = MUSIC_SEPARATION_DIR / "inference.py"
+MUSIC_SEPARATION_MODELS_DIR = Path(
+    os.environ.get("MUSIC_SEPARATION_MODELS_DIR", "/app/music_separation_models")
+)
 
 STEM_MODEL_SPECS = {
     "vocals": {
@@ -154,6 +161,9 @@ def as_bool(v, default=False) -> bool:
     if isinstance(v, str):
         return v.strip().lower() in ("1", "true", "yes", "y", "on")
     return default
+
+
+INFER_STEM_OUTPUT_FLAC = as_bool(os.environ.get("INFER_STEM_OUTPUT_FLAC"), False)
 
 
 def as_int(v, default: int) -> int:
@@ -864,6 +874,125 @@ def extract_model_artifact(zip_path: Path, dest_dir: Path):
     return {"pth": pth, "index": idx}
 
 
+def _file_ready(path: Path, min_bytes: int) -> bool:
+    try:
+        return path.exists() and path.is_file() and path.stat().st_size >= min_bytes
+    except Exception:
+        return False
+
+
+def _model_cache_slot(model_key: str) -> Path:
+    digest = hashlib.sha1(str(model_key).encode("utf-8")).hexdigest()[:24]
+    return INFER_MODEL_CACHE_DIR / digest
+
+
+def prune_model_cache(max_entries: int):
+    if max_entries < 1:
+        return
+    try:
+        if not INFER_MODEL_CACHE_DIR.exists():
+            return
+        slots = [p for p in INFER_MODEL_CACHE_DIR.iterdir() if p.is_dir()]
+        if len(slots) <= max_entries:
+            return
+        slots_sorted = sorted(slots, key=lambda p: p.stat().st_mtime, reverse=True)
+        for stale in slots_sorted[max_entries:]:
+            shutil.rmtree(stale, ignore_errors=True)
+            print(json.dumps({"event": "infer_model_cache_pruned", "slot": stale.name}))
+    except Exception as e:
+        print(json.dumps({"event": "infer_model_cache_prune_failed", "error": str(e)[:300]}))
+
+
+def resolve_infer_model_files(*, client, bucket: str, model_key: str, work: Path):
+    slot = _model_cache_slot(model_key)
+    cached_pth = slot / "model.pth"
+    cached_index = slot / "model.index"
+
+    if _file_ready(cached_pth, 5_000_000) and _file_ready(cached_index, 1_000):
+        try:
+            os.utime(slot, None)
+        except Exception:
+            pass
+        print(
+            json.dumps(
+                {
+                    "event": "infer_model_cache_hit",
+                    "slot": slot.name,
+                    "pthBytes": cached_pth.stat().st_size,
+                    "indexBytes": cached_index.stat().st_size,
+                }
+            )
+        )
+        return {
+            "pth": cached_pth,
+            "index": cached_index,
+            "cache": "hit",
+            "cacheSlot": slot.name,
+        }
+
+    started = time.time()
+    print(json.dumps({"event": "infer_model_cache_miss", "slot": slot.name, "key": model_key}))
+
+    model_zip = work / "model.zip"
+    model_extract_dir = work / "model_extract"
+    if model_zip.exists():
+        model_zip.unlink()
+    if model_extract_dir.exists():
+        shutil.rmtree(model_extract_dir, ignore_errors=True)
+
+    try:
+        print(json.dumps({"event": "infer_download_model_start", "key": model_key}))
+        client.download_file(bucket, model_key, str(model_zip))
+        print(json.dumps({"event": "infer_download_model_done", "bytes": model_zip.stat().st_size}))
+    except ClientError as e:
+        raise RuntimeError(f"Failed to download model zip: s3://{bucket}/{model_key}\n{e}") from e
+
+    extracted = extract_model_artifact(model_zip, model_extract_dir)
+    slot.mkdir(parents=True, exist_ok=True)
+
+    tmp_pth = slot / "model.pth.tmp"
+    tmp_index = slot / "model.index.tmp"
+    for p in (tmp_pth, tmp_index):
+        if p.exists():
+            p.unlink()
+
+    shutil.copy2(extracted["pth"], tmp_pth)
+    shutil.copy2(extracted["index"], tmp_index)
+
+    tmp_pth.replace(cached_pth)
+    tmp_index.replace(cached_index)
+
+    meta = {
+        "modelKey": model_key,
+        "cachedAt": int(time.time()),
+        "sourcePth": extracted["pth"].name,
+        "sourceIndex": extracted["index"].name,
+        "pthBytes": cached_pth.stat().st_size,
+        "indexBytes": cached_index.stat().st_size,
+    }
+    (slot / "meta.json").write_text(json.dumps(meta, ensure_ascii=False) + "\n", encoding="utf-8")
+
+    print(
+        json.dumps(
+            {
+                "event": "infer_model_cache_store_done",
+                "slot": slot.name,
+                "durationSec": round(max(0.0, time.time() - started), 3),
+                "pthBytes": cached_pth.stat().st_size,
+                "indexBytes": cached_index.stat().st_size,
+            }
+        )
+    )
+    prune_model_cache(INFER_MODEL_CACHE_MAX_ENTRIES)
+
+    return {
+        "pth": cached_pth,
+        "index": cached_index,
+        "cache": "miss",
+        "cacheSlot": slot.name,
+    }
+
+
 def separate_vocals_and_instrumental(
     *,
     input_audio: Path,
@@ -897,7 +1026,7 @@ def separate_vocals_and_instrumental(
             )
         )
 
-    stem_model_dir = WORK_DIR / "music_separation_models" / model_spec["id"]
+    stem_model_dir = MUSIC_SEPARATION_MODELS_DIR / model_spec["id"]
     config_path = stem_model_dir / "config.yaml"
     checkpoint_path = stem_model_dir / "model.ckpt"
 
@@ -926,12 +1055,13 @@ def separate_vocals_and_instrumental(
         str(input_audio),
         "--store_dir",
         str(out_dir),
-        "--flac_file",
         "--pcm_type",
         "PCM_16",
         "--extract_instrumental",
         "--disable_detailed_pbar",
     ]
+    if INFER_STEM_OUTPUT_FLAC:
+        sep_cmd.append("--flac_file")
 
     print(
         json.dumps(
@@ -940,6 +1070,7 @@ def separate_vocals_and_instrumental(
                 "role": role,
                 "timeoutSec": INFER_STEM_TIMEOUT_SEC,
                 "input": str(input_audio),
+                "outputFlac": INFER_STEM_OUTPUT_FLAC,
             }
         )
     )
@@ -1169,7 +1300,7 @@ def handle_infer_job(job, inp, bucket: str, client, effective_precision: str):
         pitch = 24
 
     index_rate = _clamp(as_float(inp.get("searchFeatureRatio"), 0.75), 0.0, 1.0)
-    split_audio = as_bool(inp.get("splitAudio"), True)
+    split_audio = as_bool(inp.get("splitAudio"), False)
 
     protect = _clamp(as_float(inp.get("protect"), 0.33), 0.0, 0.5)
     f0_method = str(inp.get("f0Method") or "rmvpe")
@@ -1200,11 +1331,10 @@ def handle_infer_job(job, inp, bucket: str, client, effective_precision: str):
     req_id = (job or {}).get("id", "infer")
     work = WORK_DIR / f"infer_{str(req_id)[:12]}"
     work.mkdir(parents=True, exist_ok=True)
+    infer_started_at = time.time()
 
     input_suffix = Path(str(input_key)).suffix or ".wav"
     input_path = work / f"input_audio{input_suffix}"
-    model_zip = work / "model.zip"
-    model_dir = work / "model"
     output_path = work / "converted.wav"
 
     gpu = get_gpu_diagnostics()
@@ -1244,6 +1374,8 @@ def handle_infer_job(job, inp, bucket: str, client, effective_precision: str):
                 "vocalSepModel": vocal_sep_model,
                 "karaokeSepModel": karaoke_sep_model,
                 "precision": effective_precision,
+                "stemOutputFlac": INFER_STEM_OUTPUT_FLAC,
+                "splitAudioForceAtSeconds": INFER_SPLIT_AUDIO_FORCE_AT_SECONDS,
                 "stemTimeoutSec": INFER_STEM_TIMEOUT_SEC,
                 "inferTimeoutSec": INFER_RVC_TIMEOUT_SEC,
                 "mixTimeoutSec": INFER_MIX_TIMEOUT_SEC,
@@ -1251,25 +1383,67 @@ def handle_infer_job(job, inp, bucket: str, client, effective_precision: str):
         )
     )
 
-    try:
-        print(json.dumps({"event": "infer_download_model_start", "key": model_key}))
-        client.download_file(bucket, model_key, str(model_zip))
-        print(json.dumps({"event": "infer_download_model_done", "bytes": model_zip.stat().st_size}))
-    except ClientError as e:
-        raise RuntimeError(f"Failed to download model zip: s3://{bucket}/{model_key}\n{e}") from e
+    model_resolve_started = time.time()
+    model_info = resolve_infer_model_files(client=client, bucket=bucket, model_key=model_key, work=work)
+    model_files = {
+        "pth": model_info["pth"],
+        "index": model_info["index"],
+    }
+    model_resolve_duration_sec = max(0.0, time.time() - model_resolve_started)
+    print(
+        json.dumps(
+            {
+                "event": "infer_model_ready",
+                "cache": model_info.get("cache"),
+                "cacheSlot": model_info.get("cacheSlot"),
+                "durationSec": round(model_resolve_duration_sec, 3),
+            }
+        )
+    )
 
+    input_download_started = time.time()
+    input_download_duration_sec = 0.0
     try:
         print(json.dumps({"event": "infer_download_input_start", "key": input_key}))
         client.download_file(bucket, input_key, str(input_path))
         if not input_path.exists() or input_path.stat().st_size == 0:
             raise RuntimeError("Input audio file is missing or empty after download.")
-        print(json.dumps({"event": "infer_download_input_done", "bytes": input_path.stat().st_size}))
+        input_download_duration_sec = max(0.0, time.time() - input_download_started)
+        print(
+            json.dumps(
+                {
+                    "event": "infer_download_input_done",
+                    "bytes": input_path.stat().st_size,
+                    "durationSec": round(input_download_duration_sec, 3),
+                }
+            )
+        )
     except ClientError as e:
         raise RuntimeError(f"Failed to download input audio: s3://{bucket}/{input_key}\n{e}") from e
 
-    model_files = extract_model_artifact(model_zip, model_dir)
+    input_audio_info = probe_audio(input_path)
+    print(json.dumps({"event": "infer_audio_probe", **input_audio_info}))
+    input_duration_sec = input_audio_info.get("durationSec")
+    if (
+        not split_audio
+        and isinstance(input_duration_sec, (int, float))
+        and float(input_duration_sec) >= float(INFER_SPLIT_AUDIO_FORCE_AT_SECONDS)
+    ):
+        split_audio = True
+        print(
+            json.dumps(
+                {
+                    "event": "infer_split_audio_forced",
+                    "reason": "duration_threshold",
+                    "durationSec": round(float(input_duration_sec), 3),
+                    "thresholdSec": INFER_SPLIT_AUDIO_FORCE_AT_SECONDS,
+                }
+            )
+        )
+
     stems_root = work / "stems"
     print(json.dumps({"event": "stem_separation_main_start", "model": vocal_sep_model}))
+    main_sep_started = time.time()
     main_stems = separate_vocals_and_instrumental(
         input_audio=input_path,
         out_dir=stems_root / "main",
@@ -1277,6 +1451,7 @@ def handle_infer_job(job, inp, bucket: str, client, effective_precision: str):
         vocals_name="main_vocals",
         instrumental_name="instrumental",
     )
+    main_sep_duration_sec = max(0.0, time.time() - main_sep_started)
     main_model_used = main_stems.get("modelUsed")
     lead_source = main_stems["vocals"]
     instrumental_source = main_stems["instrumental"]
@@ -1287,14 +1462,17 @@ def handle_infer_job(job, inp, bucket: str, client, effective_precision: str):
                 "leadSource": str(lead_source),
                 "instrumentalSource": str(instrumental_source),
                 "modelUsed": main_model_used,
+                "durationSec": round(main_sep_duration_sec, 3),
             }
         )
     )
 
     backing_source = None
     backing_model_used = None
+    backing_sep_duration_sec = 0.0
     if add_back_vocals:
         print(json.dumps({"event": "stem_separation_backing_start", "model": karaoke_sep_model}))
+        backing_sep_started = time.time()
         backing_stems = separate_vocals_and_instrumental(
             input_audio=lead_source,
             out_dir=stems_root / "backing",
@@ -1302,6 +1480,7 @@ def handle_infer_job(job, inp, bucket: str, client, effective_precision: str):
             vocals_name="lead_main",
             instrumental_name="backing_vocals",
         )
+        backing_sep_duration_sec = max(0.0, time.time() - backing_sep_started)
         backing_model_used = backing_stems.get("modelUsed")
         lead_source = backing_stems["vocals"]
         backing_source = backing_stems["instrumental"]
@@ -1312,11 +1491,13 @@ def handle_infer_job(job, inp, bucket: str, client, effective_precision: str):
                     "leadSource": str(lead_source),
                     "backingSource": str(backing_source),
                     "modelUsed": backing_model_used,
+                    "durationSec": round(backing_sep_duration_sec, 3),
                 }
             )
         )
 
     print(json.dumps({"event": "infer_convert_main_start", "input": str(lead_source)}))
+    main_infer_started = time.time()
     lead_converted = run_rvc_infer_file(
         input_audio=lead_source,
         output_wav=output_path,
@@ -1329,14 +1510,25 @@ def handle_infer_job(job, inp, bucket: str, client, effective_precision: str):
         export_format=export_format,
         embedder_model=embedder_model,
     )
-    print(json.dumps({"event": "infer_convert_main_done", "output": str(lead_converted)}))
+    main_infer_duration_sec = max(0.0, time.time() - main_infer_started)
+    print(
+        json.dumps(
+            {
+                "event": "infer_convert_main_done",
+                "output": str(lead_converted),
+                "durationSec": round(main_infer_duration_sec, 3),
+            }
+        )
+    )
 
     backing_for_mix = None
+    backing_infer_duration_sec = 0.0
     if add_back_vocals:
         if backing_source is None:
             raise RuntimeError("Backing vocal stem is missing.")
         if convert_back_vocals:
             print(json.dumps({"event": "infer_convert_backing_start", "input": str(backing_source)}))
+            backing_infer_started = time.time()
             backing_output = work / "backing_converted.wav"
             backing_for_mix = run_rvc_infer_file(
                 input_audio=backing_source,
@@ -1350,17 +1542,28 @@ def handle_infer_job(job, inp, bucket: str, client, effective_precision: str):
                 export_format=export_format,
                 embedder_model=embedder_model,
             )
-            print(json.dumps({"event": "infer_convert_backing_done", "output": str(backing_for_mix)}))
+            backing_infer_duration_sec = max(0.0, time.time() - backing_infer_started)
+            print(
+                json.dumps(
+                    {
+                        "event": "infer_convert_backing_done",
+                        "output": str(backing_for_mix),
+                        "durationSec": round(backing_infer_duration_sec, 3),
+                    }
+                )
+            )
         else:
             backing_for_mix = backing_source
 
     final_path = lead_converted
+    mix_duration_sec = 0.0
     if mix_with_input:
         back_volume = 0.55 if not convert_back_vocals else 0.42
         if not add_back_vocals:
             back_volume = 0.0
 
         mix_path = work / f"cover_mix.{export_format.lower()}"
+        mix_started = time.time()
         final_path = mix_cover_tracks(
             lead_path=lead_converted,
             inst_path=instrumental_source,
@@ -1368,6 +1571,7 @@ def handle_infer_job(job, inp, bucket: str, client, effective_precision: str):
             out_path=mix_path,
             back_volume=back_volume,
         )
+        mix_duration_sec = max(0.0, time.time() - mix_started)
         print(
             json.dumps(
                 {
@@ -1375,6 +1579,7 @@ def handle_infer_job(job, inp, bucket: str, client, effective_precision: str):
                     "output": str(final_path),
                     "includeBackVocals": add_back_vocals,
                     "convertBackVocals": convert_back_vocals,
+                    "durationSec": round(mix_duration_sec, 3),
                 }
             )
         )
@@ -1382,12 +1587,25 @@ def handle_infer_job(job, inp, bucket: str, client, effective_precision: str):
     # Stem preview uploads are intentionally disabled to reduce storage usage.
     # Final mixed output upload remains unchanged.
 
+    upload_duration_sec = 0.0
     try:
+        upload_started = time.time()
         print(json.dumps({"event": "infer_upload_start", "key": out_key, "bytes": final_path.stat().st_size}))
         client.upload_file(str(final_path), bucket, out_key)
-        print(json.dumps({"event": "infer_upload_done"}))
+        upload_duration_sec = max(0.0, time.time() - upload_started)
+        print(
+            json.dumps(
+                {
+                    "event": "infer_upload_done",
+                    "durationSec": round(upload_duration_sec, 3),
+                }
+            )
+        )
     except ClientError as e:
         raise RuntimeError(f"Failed to upload conversion output: s3://{bucket}/{out_key}\n{e}") from e
+
+    total_duration_sec = max(0.0, time.time() - infer_started_at)
+    print(json.dumps({"event": "infer_total_done", "durationSec": round(total_duration_sec, 3)}))
 
     return {
         "ok": True,
@@ -1403,6 +1621,17 @@ def handle_infer_job(job, inp, bucket: str, client, effective_precision: str):
         "convertBackVocals": convert_back_vocals,
         "mixedWithInput": mix_with_input,
         "requireGpu": require_gpu,
+        "timingsSec": {
+            "total": round(total_duration_sec, 3),
+            "modelResolve": round(model_resolve_duration_sec, 3),
+            "inputDownload": round(input_download_duration_sec, 3),
+            "mainStem": round(main_sep_duration_sec, 3),
+            "backingStem": round(backing_sep_duration_sec, 3),
+            "mainInfer": round(main_infer_duration_sec, 3),
+            "backingInfer": round(backing_infer_duration_sec, 3),
+            "mix": round(mix_duration_sec, 3),
+            "upload": round(upload_duration_sec, 3),
+        },
         "stemModels": {
             "main": main_model_used,
             "backing": backing_model_used,
@@ -2083,6 +2312,10 @@ def log_runtime_dependency_info() -> None:
         import onnxruntime as ort  # type: ignore
 
         info["onnxruntime"] = getattr(ort, "__version__", "unknown")
+        try:
+            info["onnxruntimeProviders"] = list(ort.get_available_providers())
+        except Exception:
+            info["onnxruntimeProviders"] = []
     except Exception as e:
         info["onnxruntime_error"] = f"{type(e).__name__}: {e}"
 
