@@ -6,6 +6,7 @@ import subprocess
 import zipfile
 import time
 import re
+import logging
 from collections import deque
 from pathlib import Path
 from urllib.request import Request, urlopen
@@ -117,6 +118,15 @@ MUSIC_SEPARATION_INFER = MUSIC_SEPARATION_DIR / "inference.py"
 MUSIC_SEPARATION_MODELS_DIR = Path(
     os.environ.get("MUSIC_SEPARATION_MODELS_DIR", "/app/music_separation_models")
 )
+AUDIO_SEPARATOR_MODEL_DIR = Path(
+    os.environ.get("AUDIO_SEPARATOR_MODEL_DIR", str(WORK_DIR / "audio_separator_models"))
+)
+
+DEFAULT_DEREVERB_MODEL_NAME = "UVR-Deecho-Dereverb"
+DEFAULT_DEECHO_MODEL_NAME = "UVR-Deecho-Normal"
+
+DEFAULT_DEREVERB_MODEL_FILE = "UVR-DeEcho-DeReverb.pth"
+DEFAULT_DEECHO_MODEL_FILE = "UVR-De-Echo-Normal.pth"
 
 STEM_MODEL_SPECS = {
     "vocals": {
@@ -168,6 +178,8 @@ def as_bool(v, default=False) -> bool:
 INFER_STEM_OUTPUT_FLAC = as_bool(os.environ.get("INFER_STEM_OUTPUT_FLAC"), False)
 INFER_STEM_CACHE_ENABLED = as_bool(os.environ.get("INFER_STEM_CACHE_ENABLED"), True)
 INFER_STEM_CACHE_UPLOAD_ENABLED = as_bool(os.environ.get("INFER_STEM_CACHE_UPLOAD_ENABLED"), True)
+AUDIO_SEPARATOR_VR_BATCH_SIZE = env_int("AUDIO_SEPARATOR_VR_BATCH_SIZE", 1)
+AUDIO_SEPARATOR_ENABLE_TTA = as_bool(os.environ.get("AUDIO_SEPARATOR_ENABLE_TTA"), False)
 
 
 def as_int(v, default: int) -> int:
@@ -200,6 +212,61 @@ def as_float(v, default: float) -> float:
 
 def normalized_model_name(v) -> str:
     return str(v or "").strip().lower()
+
+
+def model_alias_key(v) -> str:
+    return re.sub(r"[^a-z0-9]+", "", normalized_model_name(v))
+
+
+UVR_DEREVERB_MODEL_ALIAS = {
+    model_alias_key(DEFAULT_DEREVERB_MODEL_NAME): (DEFAULT_DEREVERB_MODEL_NAME, DEFAULT_DEREVERB_MODEL_FILE),
+    model_alias_key(DEFAULT_DEREVERB_MODEL_FILE): (DEFAULT_DEREVERB_MODEL_NAME, DEFAULT_DEREVERB_MODEL_FILE),
+    model_alias_key("UVR-DeEcho-DeReverb"): (DEFAULT_DEREVERB_MODEL_NAME, DEFAULT_DEREVERB_MODEL_FILE),
+}
+
+UVR_DEECHO_MODEL_ALIAS = {
+    model_alias_key(DEFAULT_DEECHO_MODEL_NAME): (DEFAULT_DEECHO_MODEL_NAME, DEFAULT_DEECHO_MODEL_FILE),
+    model_alias_key(DEFAULT_DEECHO_MODEL_FILE): (DEFAULT_DEECHO_MODEL_NAME, DEFAULT_DEECHO_MODEL_FILE),
+    model_alias_key("UVR-De-Echo-Normal"): (DEFAULT_DEECHO_MODEL_NAME, DEFAULT_DEECHO_MODEL_FILE),
+    model_alias_key("UVR-Deecho-Agggressive"): ("UVR-Deecho-Agggressive", "UVR-De-Echo-Aggressive.pth"),
+    model_alias_key("UVR-De-Echo-Aggressive"): ("UVR-Deecho-Agggressive", "UVR-De-Echo-Aggressive.pth"),
+}
+
+
+def resolve_uvr_model(stage: str, requested: str):
+    if stage == "dereverb":
+        alias = UVR_DEREVERB_MODEL_ALIAS
+        fallback = (DEFAULT_DEREVERB_MODEL_NAME, DEFAULT_DEREVERB_MODEL_FILE)
+    elif stage == "deecho":
+        alias = UVR_DEECHO_MODEL_ALIAS
+        fallback = (DEFAULT_DEECHO_MODEL_NAME, DEFAULT_DEECHO_MODEL_FILE)
+    else:
+        raise RuntimeError(f"Unknown UVR stage: {stage}")
+
+    key = model_alias_key(requested)
+    resolved = alias.get(key)
+    if resolved is not None:
+        return {
+            "name": resolved[0],
+            "file": resolved[1],
+        }
+
+    if str(requested or "").strip():
+        print(
+            json.dumps(
+                {
+                    "event": "uvr_model_forced",
+                    "stage": stage,
+                    "requested": requested,
+                    "using": fallback[0],
+                }
+            )
+        )
+
+    return {
+        "name": fallback[0],
+        "file": fallback[1],
+    }
 
 
 def s3():
@@ -1340,6 +1407,77 @@ def _resolve_stem_path(*, out_dir: Path, produced, preferred_tokens):
     return candidates[0] if candidates else None
 
 
+_AUDIO_SEPARATOR_CLASS = None
+
+
+def get_audio_separator_class():
+    global _AUDIO_SEPARATOR_CLASS
+    if _AUDIO_SEPARATOR_CLASS is not None:
+        return _AUDIO_SEPARATOR_CLASS
+
+    try:
+        from audio_separator.separator import Separator  # type: ignore
+    except Exception as e:
+        raise RuntimeError(
+            "audio-separator dependency is required for deecho/dereverb inference stages."
+        ) from e
+
+    _AUDIO_SEPARATOR_CLASS = Separator
+    return _AUDIO_SEPARATOR_CLASS
+
+
+def run_uvr_single_stem(
+    *,
+    input_audio: Path,
+    out_dir: Path,
+    stage: str,
+    model_file: str,
+    output_single_stem: str,
+):
+    Separator = get_audio_separator_class()
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    model_dir = AUDIO_SEPARATOR_MODEL_DIR / stage
+    model_dir.mkdir(parents=True, exist_ok=True)
+
+    separator = Separator(
+        model_file_dir=str(model_dir),
+        log_level=logging.WARNING,
+        normalization_threshold=1.0,
+        output_format="wav",
+        output_dir=str(out_dir),
+        output_single_stem=output_single_stem,
+        vr_params={
+            "batch_size": AUDIO_SEPARATOR_VR_BATCH_SIZE,
+            "enable_tta": AUDIO_SEPARATOR_ENABLE_TTA,
+        },
+    )
+
+    separator.load_model(model_filename=model_file)
+    produced = separator.separate(str(input_audio))
+    if not isinstance(produced, (list, tuple)):
+        produced = []
+
+    preferred_tokens = [
+        output_single_stem,
+        output_single_stem.replace(" ", ""),
+        stage,
+    ]
+    if stage == "dereverb":
+        preferred_tokens.extend(["noreverb", "no_reverb"])
+    if stage == "deecho":
+        preferred_tokens.extend(["noecho", "no_echo"])
+
+    stem_path = _resolve_stem_path(
+        out_dir=out_dir,
+        produced=produced,
+        preferred_tokens=preferred_tokens,
+    )
+    if stem_path is None:
+        raise RuntimeError(f"{stage} stage finished but output stem is missing.")
+    return stem_path
+
+
 def run_rvc_infer_file(
     *,
     input_audio: Path,
@@ -1586,6 +1724,17 @@ def handle_infer_job(job, inp, bucket: str, client, effective_precision: str):
     require_gpu_requested = as_bool(inp.get("requireGpu"), True)
     require_gpu = True
 
+    dereverb_model_requested = str(
+        inp.get("dereverbModel")
+        or DEFAULT_DEREVERB_MODEL_NAME
+    ).strip()
+    deecho_model_requested = str(
+        inp.get("deechoModel")
+        or DEFAULT_DEECHO_MODEL_NAME
+    ).strip()
+    dereverb_model = resolve_uvr_model("dereverb", dereverb_model_requested)
+    deecho_model = resolve_uvr_model("deecho", deecho_model_requested)
+
     vocal_sep_model = str(
         inp.get("vocalStemModel")
         or inp.get("vocalModel")
@@ -1645,6 +1794,8 @@ def handle_infer_job(job, inp, bucket: str, client, effective_precision: str):
                 "mixWithInput": mix_with_input,
                 "vocalSepModel": vocal_sep_model,
                 "karaokeSepModel": karaoke_sep_model,
+                "dereverbModel": dereverb_model["name"],
+                "deechoModel": deecho_model["name"],
                 "precision": effective_precision,
                 "stemOutputFlac": INFER_STEM_OUTPUT_FLAC,
                 "stemCacheEnabled": INFER_STEM_CACHE_ENABLED,
@@ -1809,31 +1960,88 @@ def handle_infer_job(job, inp, bucket: str, client, effective_precision: str):
     backing_source = None
     backing_model_used = None
     backing_sep_duration_sec = 0.0
-    if add_back_vocals:
-        print(json.dumps({"event": "stem_separation_backing_start", "model": karaoke_sep_model}))
-        backing_sep_started = time.time()
-        backing_stems = separate_vocals_and_instrumental(
-            input_audio=lead_source,
-            out_dir=stems_root / "backing",
-            model_filename=karaoke_sep_model,
-            vocals_name="lead_main",
-            instrumental_name="backing_vocals",
+    print(json.dumps({"event": "stem_separation_backing_start", "model": karaoke_sep_model}))
+    backing_sep_started = time.time()
+    backing_stems = separate_vocals_and_instrumental(
+        input_audio=lead_source,
+        out_dir=stems_root / "backing",
+        model_filename=karaoke_sep_model,
+        vocals_name="lead_main",
+        instrumental_name="backing_vocals",
+    )
+    backing_sep_duration_sec = max(0.0, time.time() - backing_sep_started)
+    backing_model_used = backing_stems.get("modelUsed")
+    lead_source = backing_stems["vocals"]
+    backing_source = backing_stems["instrumental"]
+    print(
+        json.dumps(
+            {
+                "event": "stem_separation_backing_done",
+                "leadSource": str(lead_source),
+                "backingSource": str(backing_source),
+                "modelUsed": backing_model_used,
+                "durationSec": round(backing_sep_duration_sec, 3),
+            }
         )
-        backing_sep_duration_sec = max(0.0, time.time() - backing_sep_started)
-        backing_model_used = backing_stems.get("modelUsed")
-        lead_source = backing_stems["vocals"]
-        backing_source = backing_stems["instrumental"]
-        print(
-            json.dumps(
-                {
-                    "event": "stem_separation_backing_done",
-                    "leadSource": str(lead_source),
-                    "backingSource": str(backing_source),
-                    "modelUsed": backing_model_used,
-                    "durationSec": round(backing_sep_duration_sec, 3),
-                }
-            )
+    )
+
+    dereverb_duration_sec = 0.0
+    print(
+        json.dumps(
+            {
+                "event": "stem_clean_dereverb_start",
+                "model": dereverb_model["name"],
+                "input": str(lead_source),
+            }
         )
+    )
+    dereverb_started = time.time()
+    lead_source = run_uvr_single_stem(
+        input_audio=lead_source,
+        out_dir=stems_root / "dereverb",
+        stage="dereverb",
+        model_file=dereverb_model["file"],
+        output_single_stem="No Reverb",
+    )
+    dereverb_duration_sec = max(0.0, time.time() - dereverb_started)
+    print(
+        json.dumps(
+            {
+                "event": "stem_clean_dereverb_done",
+                "output": str(lead_source),
+                "durationSec": round(dereverb_duration_sec, 3),
+            }
+        )
+    )
+
+    deecho_duration_sec = 0.0
+    print(
+        json.dumps(
+            {
+                "event": "stem_clean_deecho_start",
+                "model": deecho_model["name"],
+                "input": str(lead_source),
+            }
+        )
+    )
+    deecho_started = time.time()
+    lead_source = run_uvr_single_stem(
+        input_audio=lead_source,
+        out_dir=stems_root / "deecho",
+        stage="deecho",
+        model_file=deecho_model["file"],
+        output_single_stem="No Echo",
+    )
+    deecho_duration_sec = max(0.0, time.time() - deecho_started)
+    print(
+        json.dumps(
+            {
+                "event": "stem_clean_deecho_done",
+                "output": str(lead_source),
+                "durationSec": round(deecho_duration_sec, 3),
+            }
+        )
+    )
 
     print(json.dumps({"event": "infer_convert_main_start", "input": str(lead_source)}))
     main_infer_started = time.time()
@@ -1862,6 +2070,7 @@ def handle_infer_job(job, inp, bucket: str, client, effective_precision: str):
 
     backing_for_mix = None
     backing_infer_duration_sec = 0.0
+    backing_pitch_shift_duration_sec = 0.0
     if add_back_vocals:
         if backing_source is None:
             raise RuntimeError("Backing vocal stem is missing.")
@@ -1893,6 +2102,33 @@ def handle_infer_job(job, inp, bucket: str, client, effective_precision: str):
             )
         else:
             backing_for_mix = backing_source
+            if pitch != 0:
+                print(
+                    json.dumps(
+                        {
+                            "event": "backing_pitch_shift_start",
+                            "semitones": pitch,
+                            "input": str(backing_source),
+                        }
+                    )
+                )
+                backing_shift_started = time.time()
+                backing_shifted_path = work / "backing_pitch_shifted.wav"
+                backing_for_mix = pitch_shift_audio_preserve_duration(
+                    src_path=backing_source,
+                    out_path=backing_shifted_path,
+                    semitones=pitch,
+                )
+                backing_pitch_shift_duration_sec = max(0.0, time.time() - backing_shift_started)
+                print(
+                    json.dumps(
+                        {
+                            "event": "backing_pitch_shift_done",
+                            "output": str(backing_for_mix),
+                            "durationSec": round(backing_pitch_shift_duration_sec, 3),
+                        }
+                    )
+                )
 
     instrumental_for_mix = instrumental_source
     instrumental_pitch_shift_duration_sec = 0.0
@@ -2006,8 +2242,11 @@ def handle_infer_job(job, inp, bucket: str, client, effective_precision: str):
             "mainStem": round(main_sep_duration_sec, 3),
             "mainStemCacheUpload": round(main_cache_upload_duration_sec, 3),
             "backingStem": round(backing_sep_duration_sec, 3),
+            "dereverb": round(dereverb_duration_sec, 3),
+            "deecho": round(deecho_duration_sec, 3),
             "mainInfer": round(main_infer_duration_sec, 3),
             "backingInfer": round(backing_infer_duration_sec, 3),
+            "backingPitchShift": round(backing_pitch_shift_duration_sec, 3),
             "instrumentalPitchShift": round(instrumental_pitch_shift_duration_sec, 3),
             "mix": round(mix_duration_sec, 3),
             "upload": round(upload_duration_sec, 3),
@@ -2015,6 +2254,8 @@ def handle_infer_job(job, inp, bucket: str, client, effective_precision: str):
         "stemModels": {
             "main": main_model_used,
             "backing": backing_model_used,
+            "dereverb": dereverb_model["name"],
+            "deecho": deecho_model["name"],
         },
         "stemKeys": None,
     }
@@ -2680,7 +2921,13 @@ def handler(job):
 
 def log_runtime_dependency_info() -> None:
     info = {}
-    info["audio_separator"] = "not_installed"
+
+    try:
+        import audio_separator  # type: ignore
+
+        info["audio_separator"] = getattr(audio_separator, "__version__", "unknown")
+    except Exception as e:
+        info["audio_separator_error"] = f"{type(e).__name__}: {e}"
 
     try:
         import onnxruntime as ort  # type: ignore

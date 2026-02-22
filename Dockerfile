@@ -38,7 +38,7 @@ RUN pip install --upgrade pip \
 # Our runner deps
 COPY requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r /app/requirements.txt \
-  && python -c "import onnxruntime; print('onnxruntime', onnxruntime.__version__)" \
+  && python -c "import onnxruntime, audio_separator; print('onnxruntime', onnxruntime.__version__, 'audio_separator', getattr(audio_separator, '__version__', 'unknown'))" \
   && python -c "import sys; sys.path.append('/app/music_separation_code'); import utils; print('music_separation_code OK')"
 
 # Toolchain needed only for pip builds; keep runtime image lean.
