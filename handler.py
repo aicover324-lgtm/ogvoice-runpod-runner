@@ -1315,6 +1315,9 @@ def separate_vocals_and_instrumental(
         download_file_http(model_spec["model_url"], checkpoint_path, min_bytes=5_000_000)
         print(json.dumps({"event": "stem_model_checkpoint_download_done", "role": role, "bytes": checkpoint_path.stat().st_size}))
 
+    if model_spec["type"] == "bs_roformer":
+        sanitize_bs_roformer_config(config_path)
+
     out_dir.mkdir(parents=True, exist_ok=True)
 
     sep_cmd = [
@@ -1405,6 +1408,63 @@ def _resolve_stem_path(*, out_dir: Path, produced, preferred_tokens):
                 return p
 
     return candidates[0] if candidates else None
+
+
+def sanitize_bs_roformer_config(config_path: Path):
+    try:
+        import yaml  # type: ignore
+    except Exception as e:
+        print(
+            json.dumps(
+                {
+                    "event": "stem_model_config_sanitize_skip",
+                    "reason": "yaml_import_failed",
+                    "error": str(e)[:300],
+                }
+            )
+        )
+        return
+
+    try:
+        if not config_path.exists() or config_path.stat().st_size < 10:
+            return
+        raw = config_path.read_text(encoding="utf-8")
+        cfg = yaml.safe_load(raw)
+        if not isinstance(cfg, dict):
+            return
+        model_cfg = cfg.get("model")
+        if not isinstance(model_cfg, dict):
+            return
+
+        removed = []
+        for key in ("mlp_expansion_factor",):
+            if key in model_cfg:
+                model_cfg.pop(key, None)
+                removed.append(key)
+
+        if not removed:
+            return
+
+        config_path.write_text(yaml.safe_dump(cfg, sort_keys=False), encoding="utf-8")
+        print(
+            json.dumps(
+                {
+                    "event": "stem_model_config_sanitized",
+                    "path": str(config_path),
+                    "removedKeys": removed,
+                }
+            )
+        )
+    except Exception as e:
+        print(
+            json.dumps(
+                {
+                    "event": "stem_model_config_sanitize_failed",
+                    "path": str(config_path),
+                    "error": str(e)[:500],
+                }
+            )
+        )
 
 
 _AUDIO_SEPARATOR_CLASS = None
