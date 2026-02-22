@@ -1,6 +1,8 @@
 FROM pytorch/pytorch:2.7.1-cuda12.8-cudnn9-runtime
 
 ENV DEBIAN_FRONTEND=noninteractive
+ENV PIP_NO_CACHE_DIR=1
+ENV PIP_DISABLE_PIP_VERSION_CHECK=1
 WORKDIR /app
 
 # System deps
@@ -12,92 +14,20 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
   && rm -rf /var/lib/apt/lists/*
 
-# Applio
+# Applio (shallow clone to keep image smaller)
 RUN mkdir -p /content \
   && cd /content \
-  && git clone https://github.com/IAHispano/Applio --branch 3.6.0 --single-branch
+  && GIT_LFS_SKIP_SMUDGE=1 git clone https://github.com/IAHispano/Applio --branch 3.6.0 --single-branch --depth 1 \
+  && rm -rf /content/Applio/.git
 
 # Bundle Music Source Separation code used by RVC AI Cover Maker UI.
 # We use this path for Mel-Roformer stem models to match UI behavior.
 RUN git clone https://github.com/Eddycrack864/RVC-AI-Cover-Maker-UI --depth 1 /tmp/rvc_cover \
   && mkdir -p /app/music_separation_code \
+  && mkdir -p /app/music_separation_models \
   && cp -r /tmp/rvc_cover/programs/music_separation_code/* /app/music_separation_code/ \
   && test -f /app/music_separation_code/inference.py \
   && rm -rf /tmp/rvc_cover
-
-# Preload stem separation models to avoid runtime downloads on cold workers.
-RUN python - <<'PY'
-import time
-from pathlib import Path
-from urllib.request import Request, urlopen
-
-targets = [
-    (
-        "https://huggingface.co/OrcunAICovers/stem_seperation/resolve/main/config_deux_becruily.yaml?download=true",
-        Path("/app/music_separation_models/mel_vocals_becruily_deux/config.yaml"),
-        100,
-    ),
-    (
-        "https://huggingface.co/OrcunAICovers/stem_seperation/resolve/main/becruily_deux.ckpt?download=true",
-        Path("/app/music_separation_models/mel_vocals_becruily_deux/model.ckpt"),
-        5_000_000,
-    ),
-    (
-        "https://huggingface.co/OrcunAICovers/stem_seperation/resolve/main/karaoke_bs_roformer_anvuew.yaml?download=true",
-        Path("/app/music_separation_models/karaoke_bs_roformer_anvuew/config.yaml"),
-        100,
-    ),
-    (
-        "https://huggingface.co/OrcunAICovers/stem_seperation/resolve/main/karaoke_bs_roformer_anvuew.ckpt?download=true",
-        Path("/app/music_separation_models/karaoke_bs_roformer_anvuew/model.ckpt"),
-        5_000_000,
-    ),
-]
-
-def download(url: str, dest: Path, min_bytes: int, retries: int = 3, timeout_sec: int = 120):
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    tmp = dest.with_suffix(dest.suffix + ".tmp")
-    if tmp.exists():
-        tmp.unlink()
-
-    last_err = None
-    for i in range(retries):
-        try:
-            req = Request(url, headers={"User-Agent": "ogvoice-runpod-runner-build/1.0"})
-            with urlopen(req, timeout=timeout_sec) as r:
-                status = getattr(r, "status", 200)
-                if status >= 400:
-                    raise RuntimeError(f"HTTP {status} while downloading {url}")
-                with open(tmp, "wb") as f:
-                    while True:
-                        chunk = r.read(1024 * 1024)
-                        if not chunk:
-                            break
-                        f.write(chunk)
-
-            if not tmp.exists() or tmp.stat().st_size < min_bytes:
-                raise RuntimeError(f"Downloaded file too small: {tmp.stat().st_size if tmp.exists() else 0} bytes")
-
-            if dest.exists():
-                dest.unlink()
-            tmp.replace(dest)
-            return
-        except Exception as e:
-            last_err = e
-            try:
-                if tmp.exists():
-                    tmp.unlink()
-            except Exception:
-                pass
-            time.sleep(2 * (i + 1))
-
-    raise RuntimeError(f"Failed to download after {retries} attempts: {url}\n{last_err}")
-
-for url, dest, min_bytes in targets:
-    print(f"Downloading stem asset: {url} -> {dest}")
-    download(url, dest, min_bytes=min_bytes)
-    print(f"OK: {dest} ({dest.stat().st_size} bytes)")
-PY
 
 # Install Applio requirements.
 # IMPORTANT: include PyTorch cu128 index so torch==2.7.1+cu128 resolves.
@@ -105,98 +35,21 @@ RUN pip install --upgrade pip \
   && pip install --no-cache-dir -r /content/Applio/requirements.txt \
      --extra-index-url https://download.pytorch.org/whl/cu128
 
-# Preload Applio prerequisites at build time to avoid runtime downloads.
-# This reduces cold-start time and avoids wasting paid worker runtime.
-# NOTE: Applio core.py expects to run with CWD=/content/Applio because it reads
-# files like rvc/lib/tools/tts_voices.json using relative paths.
-RUN cd /content/Applio \
-  && python -u core.py prerequisites --models True --pretraineds_hifigan True --exe False \
-  && python - <<'PY'
-from pathlib import Path
-p = Path('/content/Applio/.prerequisites_ready')
-p.write_text('ok\n')
-print('Wrote', p)
-PY
-
 # Our runner deps
 COPY requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r /app/requirements.txt \
-  && python -c "import audio_separator, onnxruntime; print('audio_separator', getattr(audio_separator, '__version__', 'unknown'), 'onnxruntime', onnxruntime.__version__)" \
+  && python -c "import onnxruntime; print('onnxruntime', onnxruntime.__version__)" \
   && python -c "import sys; sys.path.append('/app/music_separation_code'); import utils; print('music_separation_code OK')"
+
+# Toolchain needed only for pip builds; keep runtime image lean.
+RUN apt-get update \
+  && apt-get purge -y --auto-remove build-essential git \
+  && rm -rf /var/lib/apt/lists/*
 
 COPY handler.py /app/handler.py
 
-# Download advanced pretrained weights at build time.
-# This removes runtime dependency on HuggingFace/network and ensures training
-# always uses these pretrains.
-RUN python - <<'PY'
-import os
-import time
-from pathlib import Path
-from urllib.request import Request, urlopen
-
-G_URL = os.environ.get(
-    "CUSTOM_PRETRAIN_G_URL",
-    "https://huggingface.co/OrcunAICovers/legacy_core_pretrain_v1.5/resolve/main/G_15.pth?download=true",
-)
-D_URL = os.environ.get(
-    "CUSTOM_PRETRAIN_D_URL",
-    "https://huggingface.co/OrcunAICovers/legacy_core_pretrain_v1.5/resolve/main/D_15.pth?download=true",
-)
-
-dest_dir = Path("/content/Applio/pretrained_custom")
-dest_dir.mkdir(parents=True, exist_ok=True)
-
-targets = [
-    (G_URL, dest_dir / "G_15.pth"),
-    (D_URL, dest_dir / "D_15.pth"),
-]
-
-def download(url: str, dest: Path, retries: int = 3, timeout_sec: int = 120):
-    tmp = dest.with_suffix(dest.suffix + ".tmp")
-    if tmp.exists():
-        tmp.unlink()
-
-    last_err = None
-    for i in range(retries):
-        try:
-            req = Request(url, headers={"User-Agent": "ogvoice-runpod-runner-build/1.0"})
-            with urlopen(req, timeout=timeout_sec) as r:
-                status = getattr(r, "status", 200)
-                if status >= 400:
-                    raise RuntimeError(f"HTTP {status} while downloading {url}")
-                with open(tmp, "wb") as f:
-                    while True:
-                        chunk = r.read(1024 * 1024)
-                        if not chunk:
-                            break
-                        f.write(chunk)
-
-            if not tmp.exists() or tmp.stat().st_size < 5_000_000:
-                raise RuntimeError(f"Downloaded file too small: {tmp.stat().st_size if tmp.exists() else 0} bytes")
-
-            if dest.exists():
-                dest.unlink()
-            tmp.replace(dest)
-            return
-        except Exception as e:
-            last_err = e
-            try:
-                if tmp.exists():
-                    tmp.unlink()
-            except Exception:
-                pass
-            time.sleep(2 * (i + 1))
-
-    raise RuntimeError(f"Failed to download after {retries} attempts: {url}\n{last_err}")
-
-
-for url, dest in targets:
-    print(f"Downloading: {url} -> {dest}")
-    download(url, dest)
-    print(f"OK: {dest} ({dest.stat().st_size} bytes)")
-
-PY
+# Heavy model assets are fetched lazily by handler.py and cached per worker.
+# This keeps the container image smaller and reduces pull/extract delay.
 
 # Work dir for jobs
 RUN mkdir -p /workspace

@@ -1,7 +1,6 @@
 boto3==1.34.162
 botocore==1.34.162
 runpod==1.8.1
-audio-separator[gpu]==0.18.0
 onnxruntime-gpu==1.19.0
 ml-collections==0.1.1
 omegaconf==2.2.3

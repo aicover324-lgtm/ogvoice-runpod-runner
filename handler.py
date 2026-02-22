@@ -29,7 +29,7 @@ WORK_DIR = Path("/workspace")
 PREREQ_MARKER = APPLIO_DIR / ".prerequisites_ready"
 
 # Always use these advanced pretrained weights (32k).
-# Default: baked into the image at /content/Applio/pretrained_custom/*.pth
+# Downloaded on demand and cached per worker at /content/Applio/pretrained_custom/*.pth
 CUSTOM_PRETRAIN_DIR = APPLIO_DIR / "pretrained_custom"
 CUSTOM_PRETRAIN_G_PATH = CUSTOM_PRETRAIN_DIR / "G_15.pth"
 CUSTOM_PRETRAIN_D_PATH = CUSTOM_PRETRAIN_DIR / "D_15.pth"
@@ -2680,13 +2680,7 @@ def handler(job):
 
 def log_runtime_dependency_info() -> None:
     info = {}
-
-    try:
-        import audio_separator  # type: ignore
-
-        info["audio_separator"] = getattr(audio_separator, "__version__", "unknown")
-    except Exception as e:
-        info["audio_separator_error"] = f"{type(e).__name__}: {e}"
+    info["audio_separator"] = "not_installed"
 
     try:
         import onnxruntime as ort  # type: ignore

@@ -1,0 +1,30 @@
+.git
+.gitignore
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Local artifacts and caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+env/
+
+# Training/runtime generated data (never bake into image)
+workspace/
+logs/
+models/
+datasets/
+audio_files/
+output/
+tmp/
+cache/
+
+# Optional local backups / archives
+*.zip
+*.tar
+*.tar.gz
+*.7z
