@@ -1611,59 +1611,94 @@ def run_rvc_infer_file(
     export_format: str,
     embedder_model: str,
 ):
-    infer_cmd = [
-        "python",
-        "core.py",
-        "infer",
-        "--pitch",
-        str(pitch),
-        "--index_rate",
-        str(index_rate),
-        "--volume_envelope",
-        "1",
-        "--protect",
-        str(protect),
-        "--f0_method",
-        f0_method,
-        "--input_path",
-        str(input_audio),
-        "--output_path",
-        str(output_wav),
-        "--pth_path",
-        str(model_files["pth"]),
-        "--index_path",
-        str(model_files["index"]),
-        "--split_audio",
-        str(split_audio),
-        "--f0_autotune",
-        "False",
-        "--proposed_pitch",
-        "False",
-        "--clean_audio",
-        "False",
-        "--formant_shifting",
-        "False",
-        "--post_process",
-        "False",
-        "--export_format",
-        export_format,
-        "--embedder_model",
-        embedder_model,
-        "--embedder_model_custom",
-        "",
-        "--sid",
-        "0",
-    ]
+    def build_infer_cmd(split_flag: bool):
+        return [
+            "python",
+            "core.py",
+            "infer",
+            "--pitch",
+            str(pitch),
+            "--index_rate",
+            str(index_rate),
+            "--volume_envelope",
+            "1",
+            "--protect",
+            str(protect),
+            "--f0_method",
+            f0_method,
+            "--input_path",
+            str(input_audio),
+            "--output_path",
+            str(output_wav),
+            "--pth_path",
+            str(model_files["pth"]),
+            "--index_path",
+            str(model_files["index"]),
+            "--split_audio",
+            str(split_flag),
+            "--f0_autotune",
+            "False",
+            "--proposed_pitch",
+            "False",
+            "--clean_audio",
+            "False",
+            "--formant_shifting",
+            "False",
+            "--post_process",
+            "False",
+            "--export_format",
+            export_format,
+            "--embedder_model",
+            embedder_model,
+            "--embedder_model_custom",
+            "",
+            "--sid",
+            "0",
+        ]
 
-    run(infer_cmd, cwd=str(APPLIO_DIR), timeout_sec=INFER_RVC_TIMEOUT_SEC)
+    def resolve_rvc_output(started_at: float):
+        primary = output_wav if export_format == "WAV" else Path(str(output_wav).replace(".wav", f".{export_format.lower()}"))
+        candidates = [primary, output_wav]
+        for p in candidates:
+            try:
+                if p.exists() and p.is_file() and p.stat().st_size > 0:
+                    return p
+            except Exception:
+                pass
 
-    if export_format == "WAV":
-        result_path = output_wav
-    else:
-        result_path = Path(str(output_wav).replace(".wav", f".{export_format.lower()}"))
-    if not result_path.exists() or result_path.stat().st_size == 0:
-        raise RuntimeError("RVC inference finished but output audio is missing.")
-    return result_path
+        stem = output_wav.stem
+        parent = output_wav.parent
+        fuzzy = sorted(
+            [
+                p
+                for p in parent.glob(f"{stem}*")
+                if p.is_file()
+                and p.suffix.lower() in (".wav", ".mp3", ".flac", ".ogg", ".m4a")
+                and p.stat().st_size > 0
+                and p.stat().st_mtime >= (started_at - 2.0)
+            ],
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+        return fuzzy[0] if fuzzy else None
+
+    first_start = time.time()
+    first_out = run(build_infer_cmd(split_audio), cwd=str(APPLIO_DIR), timeout_sec=INFER_RVC_TIMEOUT_SEC)
+    first_result = resolve_rvc_output(first_start)
+    if first_result is not None:
+        return first_result
+
+    if split_audio:
+        print(json.dumps({"event": "infer_split_audio_retry", "reason": "missing_output", "retrySplitAudio": False}))
+        second_start = time.time()
+        second_out = run(build_infer_cmd(False), cwd=str(APPLIO_DIR), timeout_sec=INFER_RVC_TIMEOUT_SEC)
+        second_result = resolve_rvc_output(second_start)
+        if second_result is not None:
+            return second_result
+        debug_tail = (first_out or "")[-2000:] + "\n--- retry ---\n" + (second_out or "")[-2000:]
+        raise RuntimeError(f"RVC inference finished but output audio is missing.\n\n{debug_tail}")
+
+    raise RuntimeError(f"RVC inference finished but output audio is missing.\n\n{(first_out or '')[-3000:]}")
 
 
 def _build_atempo_chain(target: float):
@@ -2382,7 +2417,7 @@ def handle_infer_job(job, inp, bucket: str, client, effective_precision: str):
 
 
 def handler(job):
-    print(json.dumps({"event": "runner_build", "build": "stemflow-20260223-karaoke-mel-default-v5"}))
+    print(json.dumps({"event": "runner_build", "build": "stemflow-20260223-karaoke-mel-default-v6"}))
     log_runtime_dependency_info()
 
     ensure_applio()
