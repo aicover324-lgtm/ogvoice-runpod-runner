@@ -89,7 +89,7 @@ VOCAL_SEP_MODEL = os.environ.get(
 )
 KARAOKE_SEP_MODEL = os.environ.get(
     "KARAOKE_SEP_MODEL",
-    "BS-Roformer Karaoke by Anvuew",
+    "Mel-Roformer Karaoke by aufr33 and viperx",
 )
 
 
@@ -142,15 +142,15 @@ STEM_MODEL_SPECS = {
         ),
     },
     "karaoke": {
-        "id": "karaoke_bs_roformer_anvuew",
-        "name": "BS-Roformer Karaoke by Anvuew",
-        "type": "bs_roformer",
-        "config_url": "https://huggingface.co/OrcunAICovers/stem_seperation/resolve/main/karaoke_bs_roformer_anvuew.yaml?download=true",
-        "model_url": "https://huggingface.co/OrcunAICovers/stem_seperation/resolve/main/karaoke_bs_roformer_anvuew.ckpt?download=true",
+        "id": "mel_karaoke_aufr33_viperx",
+        "name": "Mel-Roformer Karaoke by aufr33 and viperx",
+        "type": "mel_band_roformer",
+        "config_url": "https://huggingface.co/shiromiya/audio-separation-models/resolve/main/mel_band_roformer_karaoke_aufr33_viperx/config_mel_band_roformer_karaoke.yaml",
+        "model_url": "https://huggingface.co/shiromiya/audio-separation-models/resolve/main/mel_band_roformer_karaoke_aufr33_viperx/mel_band_roformer_karaoke_aufr33_viperx_sdr_10.1956.ckpt",
         "aliases": (
-            "bs-roformer karaoke by anvuew",
-            "karaoke_bs_roformer_anvuew.ckpt",
-            "karaoke_bs_roformer_anvuew.yaml",
+            "mel-roformer karaoke by aufr33 and viperx",
+            "mel_band_roformer_karaoke_aufr33_viperx_sdr_10.1956.ckpt",
+            "config_mel_band_roformer_karaoke.yaml",
         ),
     },
 }
@@ -2382,7 +2382,7 @@ def handle_infer_job(job, inp, bucket: str, client, effective_precision: str):
 
 
 def handler(job):
-    print(json.dumps({"event": "runner_build", "build": "stemflow-20260223-chainfix-uvr-karaoke-v4"}))
+    print(json.dumps({"event": "runner_build", "build": "stemflow-20260223-karaoke-mel-default-v5"}))
     log_runtime_dependency_info()
 
     ensure_applio()
