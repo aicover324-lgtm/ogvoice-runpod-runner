@@ -2262,7 +2262,7 @@ def handle_infer_job(job, inp, bucket: str, client, effective_precision: str):
 
 
 def handler(job):
-    print(json.dumps({"event": "runner_build", "build": "stemflow-20260219-becruily-anvuew"}))
+    print(json.dumps({"event": "runner_build", "build": "stemflow-20260223-chainfix-uvr-karaoke"}))
     log_runtime_dependency_info()
 
     ensure_applio()

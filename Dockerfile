@@ -29,6 +29,62 @@ RUN git clone https://github.com/Eddycrack864/RVC-AI-Cover-Maker-UI --depth 1 /t
   && test -f /app/music_separation_code/inference.py \
   && rm -rf /tmp/rvc_cover
 
+# Compatibility patch for BS-Roformer karaoke config variants.
+# Some checkpoints/configs include `mlp_expansion_factor` for BSRoformer; older
+# upstream code does not expose this argument and crashes at runtime.
+RUN python - <<'PY'
+from pathlib import Path
+
+p = Path('/app/music_separation_code/models/bs_roformer/bs_roformer.py')
+if not p.exists():
+    raise RuntimeError(f'Missing file: {p}')
+
+text = p.read_text(encoding='utf-8')
+orig = text
+
+sig_old = (
+    '            mask_estimator_depth=2,\n'
+    '            multi_stft_resolution_loss_weight=1.,\n'
+)
+sig_new = (
+    '            mask_estimator_depth=2,\n'
+    '            mlp_expansion_factor=4,\n'
+    '            multi_stft_resolution_loss_weight=1.,\n'
+)
+
+block_old = (
+    '            mask_estimator = MaskEstimator(\n'
+    '                dim=dim,\n'
+    '                dim_inputs=freqs_per_bands_with_complex,\n'
+    '                depth=mask_estimator_depth\n'
+    '            )\n'
+)
+block_new = (
+    '            mask_estimator = MaskEstimator(\n'
+    '                dim=dim,\n'
+    '                dim_inputs=freqs_per_bands_with_complex,\n'
+    '                depth=mask_estimator_depth,\n'
+    '                mlp_expansion_factor=mlp_expansion_factor,\n'
+    '            )\n'
+)
+
+if 'mlp_expansion_factor=4' not in text:
+    if sig_old not in text:
+        raise RuntimeError('Could not patch BSRoformer signature block')
+    text = text.replace(sig_old, sig_new, 1)
+
+if 'mlp_expansion_factor=mlp_expansion_factor' not in text:
+    if block_old not in text:
+        raise RuntimeError('Could not patch BSRoformer mask estimator block')
+    text = text.replace(block_old, block_new, 1)
+
+if text != orig:
+    p.write_text(text, encoding='utf-8')
+    print('Patched', p)
+else:
+    print('No patch needed for', p)
+PY
+
 # Install Applio requirements.
 # IMPORTANT: include PyTorch cu128 index so torch==2.7.1+cu128 resolves.
 RUN pip install --upgrade pip \
