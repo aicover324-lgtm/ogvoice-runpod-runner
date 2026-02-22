@@ -89,6 +89,22 @@ KARAOKE_SEP_MODEL = os.environ.get(
     "BS-Roformer Karaoke by Anvuew",
 )
 
+
+def env_int(name: str, default: int, minimum: int = 1) -> int:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        value = int(str(raw).strip())
+    except Exception:
+        return default
+    return max(minimum, value)
+
+
+INFER_STEM_TIMEOUT_SEC = env_int("INFER_STEM_TIMEOUT_SEC", 1800)
+INFER_RVC_TIMEOUT_SEC = env_int("INFER_RVC_TIMEOUT_SEC", 1500)
+INFER_MIX_TIMEOUT_SEC = env_int("INFER_MIX_TIMEOUT_SEC", 600)
+
 MUSIC_SEPARATION_DIR = Path("/app/music_separation_code")
 MUSIC_SEPARATION_INFER = MUSIC_SEPARATION_DIR / "inference.py"
 
@@ -189,14 +205,23 @@ def s3():
     )
 
 
-def run(cmd, cwd=None):
-    p = subprocess.run(
-        cmd,
-        cwd=cwd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-    )
+def run(cmd, cwd=None, timeout_sec=None):
+    try:
+        p = subprocess.run(
+            cmd,
+            cwd=cwd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=timeout_sec,
+        )
+    except subprocess.TimeoutExpired as e:
+        out = e.stdout if e.stdout is not None else e.output
+        tail = str(out or "")[-8000:]
+        raise RuntimeError(
+            f"Command timed out after {timeout_sec}s: {' '.join(cmd)}\n\n{tail}"
+        ) from e
+
     if p.returncode != 0:
         tail = (p.stdout or "")[-8000:]
         raise RuntimeError(f"Command failed ({p.returncode}): {' '.join(cmd)}\n\n{tail}")
@@ -907,7 +932,18 @@ def separate_vocals_and_instrumental(
         "--disable_detailed_pbar",
     ]
 
-    run(sep_cmd)
+    print(
+        json.dumps(
+            {
+                "event": "stem_separation_command_start",
+                "role": role,
+                "timeoutSec": INFER_STEM_TIMEOUT_SEC,
+                "input": str(input_audio),
+            }
+        )
+    )
+    run(sep_cmd, timeout_sec=INFER_STEM_TIMEOUT_SEC)
+    print(json.dumps({"event": "stem_separation_command_done", "role": role}))
 
     produced = sorted(
         [p for p in out_dir.glob("**/*") if p.exists() and p.is_file()],
@@ -1021,7 +1057,7 @@ def run_rvc_infer_file(
         "0",
     ]
 
-    run(infer_cmd, cwd=str(APPLIO_DIR))
+    run(infer_cmd, cwd=str(APPLIO_DIR), timeout_sec=INFER_RVC_TIMEOUT_SEC)
 
     if export_format == "WAV":
         result_path = output_wav
@@ -1080,7 +1116,7 @@ def mix_cover_tracks(*, lead_path: Path, inst_path: Path, backing_path: Path | N
             str(out_path),
         ]
 
-    run(cmd)
+    run(cmd, timeout_sec=INFER_MIX_TIMEOUT_SEC)
     if not out_path.exists() or out_path.stat().st_size == 0:
         raise RuntimeError("Final mix output is missing.")
     return out_path
@@ -1206,6 +1242,9 @@ def handle_infer_job(job, inp, bucket: str, client):
                 "mixWithInput": mix_with_input,
                 "vocalSepModel": vocal_sep_model,
                 "karaokeSepModel": karaoke_sep_model,
+                "stemTimeoutSec": INFER_STEM_TIMEOUT_SEC,
+                "inferTimeoutSec": INFER_RVC_TIMEOUT_SEC,
+                "mixTimeoutSec": INFER_MIX_TIMEOUT_SEC,
             }
         )
     )
