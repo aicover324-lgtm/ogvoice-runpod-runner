@@ -1412,46 +1412,56 @@ def _resolve_stem_path(*, out_dir: Path, produced, preferred_tokens):
 
 def sanitize_bs_roformer_config(config_path: Path):
     try:
-        import yaml  # type: ignore
-    except Exception as e:
-        print(
-            json.dumps(
-                {
-                    "event": "stem_model_config_sanitize_skip",
-                    "reason": "yaml_import_failed",
-                    "error": str(e)[:300],
-                }
-            )
-        )
-        return
-
-    try:
         if not config_path.exists() or config_path.stat().st_size < 10:
             return
+
         raw = config_path.read_text(encoding="utf-8")
-        cfg = yaml.safe_load(raw)
-        if not isinstance(cfg, dict):
-            return
-        model_cfg = cfg.get("model")
-        if not isinstance(model_cfg, dict):
-            return
+        lines = raw.splitlines(keepends=True)
+
+        removable_keys = {
+            "mlp_expansion_factor",
+            "use_torch_checkpoint",
+            "skip_connection",
+        }
 
         removed = []
-        for key in ("mlp_expansion_factor",):
-            if key in model_cfg:
-                model_cfg.pop(key, None)
-                removed.append(key)
+        out = []
+        in_model = False
+        model_indent = 0
+
+        for line in lines:
+            stripped = line.strip()
+            indent = len(line) - len(line.lstrip(" "))
+
+            if re.match(r"^model\s*:\s*$", stripped):
+                in_model = True
+                model_indent = indent
+                out.append(line)
+                continue
+
+            if in_model and stripped and indent <= model_indent:
+                in_model = False
+
+            if in_model:
+                m = re.match(r"^\s*([A-Za-z0-9_]+)\s*:", line)
+                if m:
+                    key = m.group(1)
+                    if key in removable_keys:
+                        removed.append(key)
+                        continue
+
+            out.append(line)
 
         if not removed:
             return
 
-        config_path.write_text(yaml.safe_dump(cfg, sort_keys=False), encoding="utf-8")
+        config_path.write_text("".join(out), encoding="utf-8")
         print(
             json.dumps(
                 {
                     "event": "stem_model_config_sanitized",
                     "path": str(config_path),
-                    "removedKeys": removed,
+                    "removedKeys": sorted(set(removed)),
                 }
             )
         )
@@ -2322,7 +2332,7 @@ def handle_infer_job(job, inp, bucket: str, client, effective_precision: str):
 
 
 def handler(job):
-    print(json.dumps({"event": "runner_build", "build": "stemflow-20260223-chainfix-uvr-karaoke"}))
+    print(json.dumps({"event": "runner_build", "build": "stemflow-20260223-chainfix-uvr-karaoke-v2"}))
     log_runtime_dependency_info()
 
     ensure_applio()
