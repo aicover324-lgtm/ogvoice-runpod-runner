@@ -59,7 +59,7 @@ PREREQ_LOCK_STALE_SEC = int(os.environ.get("PREREQ_LOCK_STALE_SEC", "10800"))
 PREREQ_LOCK_WAIT_TIMEOUT_SEC = int(os.environ.get("PREREQ_LOCK_WAIT_TIMEOUT_SEC", "1800"))
 MUSIC_SEPARATION_DIR = Path("/app/music_separation_code")
 MUSIC_MODELS_DIR = Path("/app/music_separation_models")
-RUNNER_BUILD = "stemflow-20260223-infer-phase2-v17"
+RUNNER_BUILD = "stemflow-20260223-infer-phase2-v18"
 
 # Always use these advanced pretrained weights (32k).
 # Downloaded on demand and cached per worker at /content/Applio/pretrained_custom/*.pth
@@ -90,6 +90,7 @@ FORCE_F0_METHOD = "rmvpe"
 FORCE_EMBEDDER_MODEL = "contentvec"
 FORCE_INCLUDE_MUTES = 2
 FORCE_BATCH_SIZE = 4
+FORCE_SAVE_EVERY_EPOCH = 50
 FORCE_INDEX_ALGORITHM = "Auto"
 FORCE_TRAINING_PRECISION = os.environ.get("APPLIO_TRAIN_PRECISION", "bf16").strip().lower()
 
@@ -2287,11 +2288,7 @@ def handler(job):
 
     batch_size = FORCE_BATCH_SIZE
 
-    save_every_epoch = as_int(inp.get("saveEveryEpoch"), 1)
-    if save_every_epoch < 1:
-        save_every_epoch = 1
-    if save_every_epoch > 100:
-        save_every_epoch = 100
+    save_every_epoch = FORCE_SAVE_EVERY_EPOCH
     save_only_latest = as_bool(inp.get("saveOnlyLatest"), True)
 
     vocoder = FORCE_VOCODER
