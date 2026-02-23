@@ -39,7 +39,7 @@ WORK_DIR = Path("/workspace")
 PREREQ_MARKER = APPLIO_DIR / ".prerequisites_ready"
 MUSIC_SEPARATION_DIR = Path("/app/music_separation_code")
 MUSIC_MODELS_DIR = Path("/app/music_separation_models")
-RUNNER_BUILD = "stemflow-20260223-infer-phase2-v4"
+RUNNER_BUILD = "stemflow-20260223-infer-phase2-v5"
 
 # Always use these advanced pretrained weights (32k).
 # Downloaded on demand and cached per worker at /content/Applio/pretrained_custom/*.pth
@@ -459,6 +459,52 @@ def ensure_applio():
     core = APPLIO_DIR / "core.py"
     if not core.exists():
         raise RuntimeError(f"Applio core.py not found: {core}")
+
+    cfg_dir = APPLIO_DIR / "rvc" / "configs"
+    if not cfg_dir.exists():
+        raise RuntimeError(f"Applio configs dir not found: {cfg_dir}")
+
+    required_configs = {
+        "32000.json": ("32000.json", "32k.json"),
+        "40000.json": ("40000.json", "40k.json"),
+        "48000.json": ("48000.json", "48k.json"),
+    }
+    for required_name, aliases in required_configs.items():
+        required_path = cfg_dir / required_name
+        if required_path.exists() and required_path.stat().st_size > 0:
+            continue
+
+        copied_from = None
+        for alias in aliases:
+            alias_path = cfg_dir / alias
+            if alias_path.exists() and alias_path.stat().st_size > 0:
+                if alias_path.resolve() != required_path.resolve():
+                    shutil.copyfile(alias_path, required_path)
+                    copied_from = alias_path
+                break
+
+        if not required_path.exists() or required_path.stat().st_size <= 0:
+            url = f"https://raw.githubusercontent.com/IAHispano/Applio/3.6.0/rvc/configs/{required_name}"
+            download_file_http(url, required_path, retries=2, timeout_sec=40, min_bytes=200)
+            print(
+                json.dumps(
+                    {
+                        "event": "applio_config_downloaded",
+                        "config": str(required_path),
+                        "url": url,
+                    }
+                )
+            )
+        elif copied_from is not None:
+            print(
+                json.dumps(
+                    {
+                        "event": "applio_config_copied_alias",
+                        "from": str(copied_from),
+                        "to": str(required_path),
+                    }
+                )
+            )
 
     # Applio internals sometimes use relative path "rvc/..." from process CWD.
     # Keep a legacy alias at /app/rvc so calls still work even outside /content/Applio.
@@ -997,39 +1043,36 @@ def extract_model_artifact(model_zip_path: Path, extract_dir: Path):
     }
 
 
-def convert_with_rvc(
-    input_audio_path: Path,
-    output_audio_path: Path,
-    model_path: Path,
-    index_path: Path | None,
-    rvc_cfg: dict,
-):
-    vc = get_voice_converter()
-    output_audio_path.parent.mkdir(parents=True, exist_ok=True)
-    started_at = time.time()
-    with pushd(APPLIO_DIR):
-        vc.convert_audio(
-            audio_input_path=str(input_audio_path),
-            audio_output_path=str(output_audio_path),
-            model_path=str(model_path),
-            index_path=str(index_path) if index_path else "",
-            embedder_model=str(rvc_cfg.get("embedderModel") or INFER_DEFAULT_EMBEDDER),
-            pitch=as_int(rvc_cfg.get("pitch"), 0),
-            f0_file=None,
-            f0_method=str(rvc_cfg.get("pitchExtractor") or INFER_DEFAULT_PITCH_EXTRACTOR),
-            filter_radius=as_int(rvc_cfg.get("filterRadius"), INFER_DEFAULT_FILTER_RADIUS),
-            index_rate=as_float(rvc_cfg.get("searchFeatureRatio"), INFER_DEFAULT_INDEX_RATE),
-            volume_envelope=as_float(rvc_cfg.get("volumeEnvelope"), INFER_DEFAULT_RMS_MIX_RATE),
-            protect=as_float(rvc_cfg.get("protectVoicelessConsonants"), INFER_DEFAULT_PROTECT),
-            split_audio=as_bool(rvc_cfg.get("splitAudio"), INFER_DEFAULT_SPLIT_AUDIO),
-            f0_autotune=as_bool(rvc_cfg.get("autotune"), INFER_DEFAULT_AUTOTUNE),
-            hop_length=as_int(rvc_cfg.get("hopLength"), INFER_DEFAULT_HOP_LENGTH),
-            export_format=INFER_DEFAULT_EXPORT_FORMAT,
-            embedder_model_custom=None,
-        )
+def ensure_wav_for_rvc_input(input_audio_path: Path, temp_dir: Path):
+    temp_dir.mkdir(parents=True, exist_ok=True)
+    wav_input = temp_dir / f"{input_audio_path.stem}_for_rvc.wav"
+    run(
+        [
+            "ffmpeg",
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-i",
+            str(input_audio_path),
+            "-ar",
+            "44100",
+            "-ac",
+            "1",
+            str(wav_input),
+        ]
+    )
+    return wav_input
 
+
+def recover_rvc_output(
+    output_audio_path: Path,
+    input_audio_path: Path,
+    started_at: float,
+    attempt: str,
+):
     if output_audio_path.exists() and output_audio_path.stat().st_size > 0:
-        return
+        return True
 
     # Applio sometimes writes output into CWD or with a rewritten extension/name.
     # Recover by probing likely locations and normalizing to requested output path.
@@ -1061,6 +1104,7 @@ def convert_with_rvc(
                     json.dumps(
                         {
                             "event": "infer_rvc_output_recovered",
+                            "attempt": attempt,
                             "from": str(cand),
                             "to": str(output_audio_path),
                             "bytes": output_audio_path.stat().st_size if output_audio_path.exists() else None,
@@ -1068,7 +1112,7 @@ def convert_with_rvc(
                     )
                 )
                 if output_audio_path.exists() and output_audio_path.stat().st_size > 0:
-                    return
+                    return True
         except Exception:
             continue
 
@@ -1102,6 +1146,7 @@ def convert_with_rvc(
             json.dumps(
                 {
                     "event": "infer_rvc_output_recovered_recent",
+                    "attempt": attempt,
                     "from": str(cand),
                     "to": str(output_audio_path),
                     "bytes": output_audio_path.stat().st_size if output_audio_path.exists() else None,
@@ -1109,7 +1154,7 @@ def convert_with_rvc(
             )
         )
         if output_audio_path.exists() and output_audio_path.stat().st_size > 0:
-            return
+            return True
 
     # Final fallback: any very recent audio file created during conversion.
     recent_any = []
@@ -1142,6 +1187,7 @@ def convert_with_rvc(
             json.dumps(
                 {
                     "event": "infer_rvc_output_recovered_any_recent",
+                    "attempt": attempt,
                     "from": str(cand),
                     "to": str(output_audio_path),
                     "bytes": output_audio_path.stat().st_size if output_audio_path.exists() else None,
@@ -1149,11 +1195,143 @@ def convert_with_rvc(
             )
         )
         if output_audio_path.exists() and output_audio_path.stat().st_size > 0:
+            return True
+
+    return False
+
+
+def convert_with_rvc(
+    input_audio_path: Path,
+    output_audio_path: Path,
+    model_path: Path,
+    index_path: Path | None,
+    rvc_cfg: dict,
+):
+    output_audio_path.parent.mkdir(parents=True, exist_ok=True)
+
+    requested_split_audio = as_bool(rvc_cfg.get("splitAudio"), INFER_DEFAULT_SPLIT_AUDIO)
+    attempts: list[tuple[str, Path, bool]] = [
+        ("requested", input_audio_path, requested_split_audio),
+    ]
+    if requested_split_audio:
+        attempts.append(("fallback_split_disabled", input_audio_path, False))
+
+    wav_input = output_audio_path.parent / f"{input_audio_path.stem}_for_rvc.wav"
+    attempts.append(("fallback_wav_input", wav_input, False))
+    if requested_split_audio:
+        attempts.append(("fallback_wav_input_with_split", wav_input, True))
+
+    failures = []
+    for idx, (attempt, attempt_input_path, split_audio) in enumerate(attempts, start=1):
+        started_at = time.time()
+        if output_audio_path.exists():
+            try:
+                output_audio_path.unlink()
+            except Exception:
+                pass
+
+        if attempt_input_path == wav_input:
+            try:
+                attempt_input_path = ensure_wav_for_rvc_input(input_audio_path, output_audio_path.parent)
+            except Exception as e:
+                failures.append(f"{attempt}: wav_prepare_exception={type(e).__name__}: {str(e)[:240]}")
+                print(
+                    json.dumps(
+                        {
+                            "event": "infer_rvc_attempt_prepare_exception",
+                            "attemptIndex": idx,
+                            "attempt": attempt,
+                            "error": str(e)[:600],
+                        }
+                    )
+                )
+                continue
+
+        if not attempt_input_path.exists() or attempt_input_path.stat().st_size <= 0:
+            failures.append(f"{attempt}: input_missing={attempt_input_path}")
+            continue
+
+        print(
+            json.dumps(
+                {
+                    "event": "infer_rvc_attempt_start",
+                    "attemptIndex": idx,
+                    "attempt": attempt,
+                    "input": str(attempt_input_path),
+                    "splitAudio": bool(split_audio),
+                }
+            )
+        )
+
+        try:
+            vc = get_voice_converter()
+            with pushd(APPLIO_DIR):
+                vc.convert_audio(
+                    audio_input_path=str(attempt_input_path),
+                    audio_output_path=str(output_audio_path),
+                    model_path=str(model_path),
+                    index_path=str(index_path) if index_path else "",
+                    embedder_model=str(rvc_cfg.get("embedderModel") or INFER_DEFAULT_EMBEDDER),
+                    pitch=as_int(rvc_cfg.get("pitch"), 0),
+                    f0_file=None,
+                    f0_method=str(rvc_cfg.get("pitchExtractor") or INFER_DEFAULT_PITCH_EXTRACTOR),
+                    filter_radius=as_int(rvc_cfg.get("filterRadius"), INFER_DEFAULT_FILTER_RADIUS),
+                    index_rate=as_float(rvc_cfg.get("searchFeatureRatio"), INFER_DEFAULT_INDEX_RATE),
+                    volume_envelope=as_float(rvc_cfg.get("volumeEnvelope"), INFER_DEFAULT_RMS_MIX_RATE),
+                    protect=as_float(rvc_cfg.get("protectVoicelessConsonants"), INFER_DEFAULT_PROTECT),
+                    split_audio=bool(split_audio),
+                    f0_autotune=as_bool(rvc_cfg.get("autotune"), INFER_DEFAULT_AUTOTUNE),
+                    hop_length=as_int(rvc_cfg.get("hopLength"), INFER_DEFAULT_HOP_LENGTH),
+                    export_format=INFER_DEFAULT_EXPORT_FORMAT,
+                    embedder_model_custom=None,
+                )
+        except Exception as e:
+            failures.append(f"{attempt}: convert_exception={type(e).__name__}: {str(e)[:240]}")
+            print(
+                json.dumps(
+                    {
+                        "event": "infer_rvc_attempt_exception",
+                        "attemptIndex": idx,
+                        "attempt": attempt,
+                        "error": str(e)[:600],
+                    }
+                )
+            )
+            continue
+
+        if recover_rvc_output(
+            output_audio_path=output_audio_path,
+            input_audio_path=attempt_input_path,
+            started_at=started_at,
+            attempt=attempt,
+        ):
+            print(
+                json.dumps(
+                    {
+                        "event": "infer_rvc_attempt_success",
+                        "attemptIndex": idx,
+                        "attempt": attempt,
+                        "output": str(output_audio_path),
+                        "bytes": output_audio_path.stat().st_size if output_audio_path.exists() else None,
+                    }
+                )
+            )
             return
+
+        failures.append(f"{attempt}: no_output")
+        print(
+            json.dumps(
+                {
+                    "event": "infer_rvc_attempt_no_output",
+                    "attemptIndex": idx,
+                    "attempt": attempt,
+                }
+            )
+        )
 
     raise RuntimeError(
         "RVC conversion completed but output file is missing: "
-        f"{output_audio_path} (checked expected path, common Applio output dirs, and recent files)"
+        f"{output_audio_path} (attempts={'; '.join(failures)})"
     )
 
 
