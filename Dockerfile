@@ -52,55 +52,50 @@ if not preload_enabled:
 assets = [
     # Mel-Roformer vocals
     (
-        "https://huggingface.co/OrcunAICovers/stem_seperation/resolve/main/config_deux_becruily.yaml?download=true",
+        "https://huggingface.co/OrcunAICovers/stem_seperation/resolve/main/seperation_models/vocals/config_deux_becruily.yaml?download=true",
         "/app/music_separation_models/vocals_mel_roformer/config.yaml",
         200,
     ),
     (
-        "https://huggingface.co/OrcunAICovers/stem_seperation/resolve/main/becruily_deux.ckpt?download=true",
+        "https://huggingface.co/OrcunAICovers/stem_seperation/resolve/main/seperation_models/vocals/becruily_deux.ckpt?download=true",
         "/app/music_separation_models/vocals_mel_roformer/model.ckpt",
         5_000_000,
     ),
     # Mel-Roformer karaoke
     (
-        "https://huggingface.co/OrcunAICovers/stem_seperation/resolve/main/config_karaoke_frazer_becruily.yaml?download=true",
+        "https://huggingface.co/OrcunAICovers/stem_seperation/resolve/main/seperation_models/karaoke/mel_band_roformer_karaoke_aufr33_viperx_config_mel_band_roformer_karaoke.yaml?download=true",
         "/app/music_separation_models/karaoke_mel_roformer/config.yaml",
         200,
     ),
     (
-        "https://huggingface.co/OrcunAICovers/stem_seperation/resolve/main/bs_roformer_karaoke_frazer_becruily.ckpt?download=true",
+        "https://huggingface.co/OrcunAICovers/stem_seperation/resolve/main/seperation_models/karaoke/mel_band_roformer_karaoke_aufr33_viperx_sdr_10.1956.ckpt?download=true",
         "/app/music_separation_models/karaoke_mel_roformer/model.ckpt",
         5_000_000,
     ),
-    # UVR de-reverb / de-echo models
+    # UVR de-reverb model (deecho stage is disabled)
     (
-        "https://huggingface.co/shiromiya/audio-separation-models/resolve/main/UVR-DeEcho-DeReverb.pth",
+        "https://huggingface.co/OrcunAICovers/stem_seperation/resolve/main/seperation_models/deecho-dereverb/UVR-DeEcho-DeReverb.pth?download=true",
         "/app/music_separation_models/uvr/UVR-DeEcho-DeReverb.pth",
-        5_000_000,
-    ),
-    (
-        "https://huggingface.co/shiromiya/audio-separation-models/resolve/main/UVR-De-Echo-Normal.pth",
-        "/app/music_separation_models/uvr/UVR-De-Echo-Normal.pth",
         5_000_000,
     ),
     # Cover Applio predictors and embedder
     (
-        "https://huggingface.co/IAHispano/Applio/resolve/main/Resources/predictors/rmvpe.pt",
+        "https://huggingface.co/OrcunAICovers/stem_seperation/resolve/main/seperation_models/RVC%20pitch%20predictors/rmvpe.pt?download=true",
         "/app/programs/applio_code/rvc/models/predictors/rmvpe.pt",
         1_000_000,
     ),
     (
-        "https://huggingface.co/IAHispano/Applio/resolve/main/Resources/predictors/fcpe.pt",
+        "https://huggingface.co/OrcunAICovers/stem_seperation/resolve/main/seperation_models/RVC%20pitch%20predictors/fcpe.pt?download=true",
         "/app/programs/applio_code/rvc/models/predictors/fcpe.pt",
         1_000_000,
     ),
     (
-        "https://huggingface.co/IAHispano/Applio/resolve/main/Resources/embedders/contentvec/pytorch_model.bin",
+        "https://huggingface.co/OrcunAICovers/stem_seperation/resolve/main/seperation_models/RVC%20embedder%20(contentvec)/pytorch_model.bin?download=true",
         "/app/programs/applio_code/rvc/models/embedders/contentvec/pytorch_model.bin",
         1_000_000,
     ),
     (
-        "https://huggingface.co/IAHispano/Applio/resolve/main/Resources/embedders/contentvec/config.json",
+        "https://huggingface.co/OrcunAICovers/stem_seperation/resolve/main/seperation_models/RVC%20embedder%20(contentvec)/Resources_embedders_contentvec_config.json?download=true",
         "/app/programs/applio_code/rvc/models/embedders/contentvec/config.json",
         200,
     ),

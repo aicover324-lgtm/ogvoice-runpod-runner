@@ -56,7 +56,7 @@ WORK_DIR = Path("/workspace")
 PREREQ_MARKER = APPLIO_DIR / ".prerequisites_ready"
 MUSIC_SEPARATION_DIR = Path("/app/music_separation_code")
 MUSIC_MODELS_DIR = Path("/app/music_separation_models")
-RUNNER_BUILD = "stemflow-20260223-infer-phase2-v13"
+RUNNER_BUILD = "stemflow-20260223-infer-phase2-v15"
 
 # Always use these advanced pretrained weights (32k).
 # Downloaded on demand and cached per worker at /content/Applio/pretrained_custom/*.pth
@@ -105,6 +105,13 @@ FORCE_PROCESS_EFFECTS = True
 # - noise reduction: off
 FORCE_NOISE_REDUCTION = False
 
+# Training Applio config backups (owner-controlled mirror).
+APPLIO_TRAIN_CONFIG_URLS = {
+    "32000.json": "https://huggingface.co/OrcunAICovers/stem_seperation/resolve/main/training/32000.json?download=true",
+    "40000.json": "https://huggingface.co/OrcunAICovers/stem_seperation/resolve/main/training/40000.json?download=true",
+    "48000.json": "https://huggingface.co/OrcunAICovers/stem_seperation/resolve/main/training/48000.json?download=true",
+}
+
 # Inference defaults and model sources (phase-1 cover pipeline).
 INFER_DEFAULT_EXPORT_FORMAT = "WAV"
 INFER_DEFAULT_PITCH_EXTRACTOR = "rmvpe"
@@ -119,24 +126,24 @@ INFER_DEFAULT_AUTOTUNE = False
 INFER_DEFAULT_USE_TTA = False
 INFER_DEFAULT_BATCH_SIZE = 1
 
-# Stem-separation model sources are locked to RVC-AI-Cover-Maker references.
-VOCALS_MODEL_CONFIG_URL = "https://huggingface.co/OrcunAICovers/stem_seperation/resolve/main/config_deux_becruily.yaml?download=true"
-VOCALS_MODEL_CKPT_URL = "https://huggingface.co/OrcunAICovers/stem_seperation/resolve/main/becruily_deux.ckpt?download=true"
-KARAOKE_MODEL_CONFIG_URL = "https://huggingface.co/OrcunAICovers/stem_seperation/resolve/main/config_karaoke_frazer_becruily.yaml?download=true"
-KARAOKE_MODEL_CKPT_URL = "https://huggingface.co/OrcunAICovers/stem_seperation/resolve/main/bs_roformer_karaoke_frazer_becruily.ckpt?download=true"
+# Stem-separation model sources.
+VOCALS_MODEL_CONFIG_URL = "https://huggingface.co/OrcunAICovers/stem_seperation/resolve/main/seperation_models/vocals/config_deux_becruily.yaml?download=true"
+VOCALS_MODEL_CKPT_URL = "https://huggingface.co/OrcunAICovers/stem_seperation/resolve/main/seperation_models/vocals/becruily_deux.ckpt?download=true"
+KARAOKE_MODEL_CONFIG_URL = "https://huggingface.co/OrcunAICovers/stem_seperation/resolve/main/seperation_models/karaoke/mel_band_roformer_karaoke_aufr33_viperx_config_mel_band_roformer_karaoke.yaml?download=true"
+KARAOKE_MODEL_CKPT_URL = "https://huggingface.co/OrcunAICovers/stem_seperation/resolve/main/seperation_models/karaoke/mel_band_roformer_karaoke_aufr33_viperx_sdr_10.1956.ckpt?download=true"
 
 UVR_MODEL_FILE_DEREVERB = "UVR-DeEcho-DeReverb.pth"
-UVR_MODEL_FILE_DEECHO = "UVR-De-Echo-Normal.pth"
+UVR_MODEL_DEREVERB_URL = "https://huggingface.co/OrcunAICovers/stem_seperation/resolve/main/seperation_models/deecho-dereverb/UVR-DeEcho-DeReverb.pth?download=true"
 UVR_MODELS_DIR = MUSIC_MODELS_DIR / "uvr"
 
-COVER_RESOURCES_BASE_URL = "https://huggingface.co/IAHispano/Applio/resolve/main/Resources"
-COVER_RMVPE_URL = f"{COVER_RESOURCES_BASE_URL}/predictors/rmvpe.pt"
-COVER_FCPE_URL = f"{COVER_RESOURCES_BASE_URL}/predictors/fcpe.pt"
+COVER_RMVPE_URL = "https://huggingface.co/OrcunAICovers/stem_seperation/resolve/main/seperation_models/RVC%20pitch%20predictors/rmvpe.pt?download=true"
+COVER_FCPE_URL = "https://huggingface.co/OrcunAICovers/stem_seperation/resolve/main/seperation_models/RVC%20pitch%20predictors/fcpe.pt?download=true"
+COVER_CONTENTVEC_BIN_URL = "https://huggingface.co/OrcunAICovers/stem_seperation/resolve/main/seperation_models/RVC%20embedder%20(contentvec)/pytorch_model.bin?download=true"
+COVER_CONTENTVEC_CONFIG_URL = "https://huggingface.co/OrcunAICovers/stem_seperation/resolve/main/seperation_models/RVC%20embedder%20(contentvec)/Resources_embedders_contentvec_config.json?download=true"
 
 INFER_FIXED_VOCALS_MODEL = "mel-band-roformer-deux"
-INFER_FIXED_KARAOKE_MODEL = "bs_roformer_karaoke_frazer_becruily"
+INFER_FIXED_KARAOKE_MODEL = "Mel-Roformer Karaoke by aufr33 and viperx"
 INFER_FIXED_DEREVERB_MODEL = "UVR-Deecho-Dereverb"
-INFER_FIXED_DEECHO_MODEL = "UVR-Deecho-Normal"
 
 ALLOWED_EXPORT_FORMATS = {"WAV", "MP3", "FLAC", "OGG", "M4A"}
 ALLOWED_PITCH_EXTRACTORS = {"rmvpe", "crepe", "crepe-tiny", "fcpe"}
@@ -488,7 +495,9 @@ def ensure_applio():
                 break
 
         if not required_path.exists() or required_path.stat().st_size <= 0:
-            url = f"https://raw.githubusercontent.com/IAHispano/Applio/3.6.0/rvc/configs/{required_name}"
+            url = APPLIO_TRAIN_CONFIG_URLS.get(required_name)
+            if not url:
+                raise RuntimeError(f"Missing APPLIO_TRAIN_CONFIG_URLS entry for {required_name}")
             download_file_http(url, required_path, retries=2, timeout_sec=40, min_bytes=200)
             print(
                 json.dumps(
@@ -585,6 +594,28 @@ def ensure_cover_applio():
     if not fcpe_path.exists() or fcpe_path.stat().st_size < 1_000_000:
         download_file_http(COVER_FCPE_URL, fcpe_path, retries=3, timeout_sec=180, min_bytes=1_000_000)
         print(json.dumps({"event": "cover_predictor_ready", "name": "fcpe", "path": str(fcpe_path)}))
+
+    contentvec_dir = cover_rvc / "models" / "embedders" / "contentvec"
+    contentvec_bin_path = contentvec_dir / "pytorch_model.bin"
+    contentvec_cfg_path = contentvec_dir / "config.json"
+    if not contentvec_bin_path.exists() or contentvec_bin_path.stat().st_size < 1_000_000:
+        download_file_http(
+            COVER_CONTENTVEC_BIN_URL,
+            contentvec_bin_path,
+            retries=3,
+            timeout_sec=180,
+            min_bytes=1_000_000,
+        )
+        print(json.dumps({"event": "cover_embedder_ready", "name": "contentvec_bin", "path": str(contentvec_bin_path)}))
+    if not contentvec_cfg_path.exists() or contentvec_cfg_path.stat().st_size < 200:
+        download_file_http(
+            COVER_CONTENTVEC_CONFIG_URL,
+            contentvec_cfg_path,
+            retries=3,
+            timeout_sec=180,
+            min_bytes=200,
+        )
+        print(json.dumps({"event": "cover_embedder_ready", "name": "contentvec_config", "path": str(contentvec_cfg_path)}))
 
 
 def force_cover_applio_precision(preferred: str) -> str:
@@ -895,8 +926,9 @@ def normalize_audio_separation_config(raw: dict):
         "vocalsModel": INFER_FIXED_VOCALS_MODEL,
         "karaokeModel": INFER_FIXED_KARAOKE_MODEL,
         "dereverbModel": INFER_FIXED_DEREVERB_MODEL,
-        "deechoEnabled": True,
-        "deechoModel": INFER_FIXED_DEECHO_MODEL,
+        # Deecho is intentionally disabled in the current pipeline.
+        "deechoEnabled": False,
+        "deechoModel": None,
         "denoiseEnabled": False,
     }
 
@@ -943,11 +975,13 @@ def ensure_music_separation_models():
         try:
             vocals = _MUSIC_MODEL_DEFS_CACHE["vocals"]
             karaoke = _MUSIC_MODEL_DEFS_CACHE["karaoke"]
+            dereverb = _MUSIC_MODEL_DEFS_CACHE["dereverb"]
             if (
                 Path(vocals["config"]).exists()
                 and Path(vocals["ckpt"]).exists()
                 and Path(karaoke["config"]).exists()
                 and Path(karaoke["ckpt"]).exists()
+                and Path(dereverb["model_file"]).exists()
             ):
                 return _MUSIC_MODEL_DEFS_CACHE
         except Exception:
@@ -959,6 +993,7 @@ def ensure_music_separation_models():
     vocals_ckpt = vocals_dir / "model.ckpt"
     karaoke_cfg = karaoke_dir / "config.yaml"
     karaoke_ckpt = karaoke_dir / "model.ckpt"
+    dereverb_model = UVR_MODELS_DIR / UVR_MODEL_FILE_DEREVERB
 
     if not vocals_cfg.exists():
         download_file_http(VOCALS_MODEL_CONFIG_URL, vocals_cfg, min_bytes=200)
@@ -969,10 +1004,13 @@ def ensure_music_separation_models():
         download_file_http(KARAOKE_MODEL_CONFIG_URL, karaoke_cfg, min_bytes=200)
     if not karaoke_ckpt.exists() or karaoke_ckpt.stat().st_size < 5_000_000:
         download_file_http(KARAOKE_MODEL_CKPT_URL, karaoke_ckpt, min_bytes=5_000_000)
+    if not dereverb_model.exists() or dereverb_model.stat().st_size < 5_000_000:
+        download_file_http(UVR_MODEL_DEREVERB_URL, dereverb_model, min_bytes=5_000_000)
 
     models = {
         "vocals": {"config": vocals_cfg, "ckpt": vocals_ckpt, "model_type": "mel_band_roformer"},
-        "karaoke": {"config": karaoke_cfg, "ckpt": karaoke_ckpt, "model_type": "bs_roformer"},
+        "karaoke": {"config": karaoke_cfg, "ckpt": karaoke_ckpt, "model_type": "mel_band_roformer"},
+        "dereverb": {"model_file": dereverb_model},
     }
     print(
         json.dumps(
@@ -994,7 +1032,9 @@ def ensure_music_separation_models():
                     "ckptPath": str(karaoke_ckpt),
                 },
                 "dereverb": {"name": INFER_FIXED_DEREVERB_MODEL, "modelFile": UVR_MODEL_FILE_DEREVERB},
-                "deecho": {"name": INFER_FIXED_DEECHO_MODEL, "modelFile": UVR_MODEL_FILE_DEECHO},
+                "dereverbUrl": UVR_MODEL_DEREVERB_URL,
+                "dereverbPath": str(dereverb_model),
+                "deechoEnabled": False,
                 "denoiseEnabled": False,
             }
         )
@@ -1700,7 +1740,7 @@ def handle_infer_job(job: dict, inp: dict, client, bucket: str):
                     "vocalsModel": INFER_FIXED_VOCALS_MODEL,
                     "karaokeModel": INFER_FIXED_KARAOKE_MODEL,
                     "dereverbModel": INFER_FIXED_DEREVERB_MODEL,
-                    "deechoModel": INFER_FIXED_DEECHO_MODEL,
+                    "deechoEnabled": False,
                 },
             }
         )
@@ -1720,7 +1760,6 @@ def handle_infer_job(job: dict, inp: dict, client, bucket: str):
     stems_vocals_dir = work_dir / "stems_vocals"
     stems_karaoke_dir = work_dir / "stems_karaoke"
     stems_dereverb_dir = work_dir / "stems_dereverb"
-    stems_deecho_dir = work_dir / "stems_deecho"
     output_dir = work_dir / "output"
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1763,7 +1802,7 @@ def handle_infer_job(job: dict, inp: dict, client, bucket: str):
         use_tta=use_tta,
     )
     # Keep chain aligned with reference cover maker:
-    # vocals -> karaoke vocal -> dereverb -> deecho -> RVC
+    # vocals -> karaoke vocal -> dereverb -> RVC
     karaoke_vocal_stem = find_karaoke_vocal_stem(stems_karaoke_dir)
     backing_stem = find_stem_file(stems_karaoke_dir, "_instrumental") or find_stem_file(
         stems_karaoke_dir, "instrumental"
@@ -1798,28 +1837,17 @@ def handle_infer_job(job: dict, inp: dict, client, bucket: str):
     dereverb_stem = run_uvr_single_stem(
         input_path=karaoke_vocal_stem,
         store_dir=stems_dereverb_dir,
-        model_filename=UVR_MODEL_FILE_DEREVERB,
+        model_filename=model_defs["dereverb"]["model_file"].name,
         output_single_stem="No Reverb",
         use_tta=use_tta,
         batch_size=batch_size,
     )
     print(json.dumps({"event": "infer_dereverb_done", "output": dereverb_stem.name}))
 
-    print(json.dumps({"event": "infer_deecho_start", "model": INFER_FIXED_DEECHO_MODEL}))
-    deecho_stem = run_uvr_single_stem(
-        input_path=dereverb_stem,
-        store_dir=stems_deecho_dir,
-        model_filename=UVR_MODEL_FILE_DEECHO,
-        output_single_stem="No Echo",
-        use_tta=use_tta,
-        batch_size=batch_size,
-    )
-    print(json.dumps({"event": "infer_deecho_done", "output": deecho_stem.name}))
-
     converted_main_vocals = output_dir / "main_vocals_converted.wav"
     print(json.dumps({"event": "infer_rvc_main_start"}))
     convert_with_rvc(
-        input_audio_path=deecho_stem,
+        input_audio_path=dereverb_stem,
         output_audio_path=converted_main_vocals,
         model_path=model_path,
         index_path=index_path,
