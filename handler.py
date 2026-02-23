@@ -39,6 +39,7 @@ WORK_DIR = Path("/workspace")
 PREREQ_MARKER = APPLIO_DIR / ".prerequisites_ready"
 MUSIC_SEPARATION_DIR = Path("/app/music_separation_code")
 MUSIC_MODELS_DIR = Path("/app/music_separation_models")
+RUNNER_BUILD = "stemflow-20260223-infer-phase2-v2"
 
 # Always use these advanced pretrained weights (32k).
 # Downloaded on demand and cached per worker at /content/Applio/pretrained_custom/*.pth
@@ -458,6 +459,17 @@ def ensure_applio():
     core = APPLIO_DIR / "core.py"
     if not core.exists():
         raise RuntimeError(f"Applio core.py not found: {core}")
+
+    # Applio internals sometimes use relative path "rvc/..." from process CWD.
+    # Keep a legacy alias at /app/rvc so calls still work even outside /content/Applio.
+    applio_rvc = APPLIO_DIR / "rvc"
+    app_rvc_alias = Path("/app/rvc")
+    if applio_rvc.exists() and not app_rvc_alias.exists():
+        try:
+            app_rvc_alias.symlink_to(applio_rvc, target_is_directory=True)
+            print(json.dumps({"event": "applio_alias_created", "alias": str(app_rvc_alias), "target": str(applio_rvc)}))
+        except Exception as e:
+            print(json.dumps({"event": "applio_alias_create_failed", "alias": str(app_rvc_alias), "error": str(e)[:300]}))
 
 
 def download_file_http(
@@ -1340,7 +1352,7 @@ def handle_infer_job(job: dict, inp: dict, client, bucket: str):
 
 
 def handler(job):
-    print(json.dumps({"event": "runner_build", "build": "stemflow-20260223-infer-phase2-v1"}))
+    print(json.dumps({"event": "runner_build", "build": RUNNER_BUILD}))
     log_runtime_dependency_info()
 
     ensure_applio()
