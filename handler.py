@@ -35,11 +35,13 @@ except Exception:
 
 
 APPLIO_DIR = Path("/content/Applio")
+APPLIO_COVER_ROOT = Path("/app")
+APPLIO_COVER_DIR = APPLIO_COVER_ROOT / "programs" / "applio_code"
 WORK_DIR = Path("/workspace")
 PREREQ_MARKER = APPLIO_DIR / ".prerequisites_ready"
 MUSIC_SEPARATION_DIR = Path("/app/music_separation_code")
 MUSIC_MODELS_DIR = Path("/app/music_separation_models")
-RUNNER_BUILD = "stemflow-20260223-infer-phase2-v5"
+RUNNER_BUILD = "stemflow-20260223-infer-phase2-v6"
 
 # Always use these advanced pretrained weights (32k).
 # Downloaded on demand and cached per worker at /content/Applio/pretrained_custom/*.pth
@@ -518,6 +520,79 @@ def ensure_applio():
             print(json.dumps({"event": "applio_alias_create_failed", "alias": str(app_rvc_alias), "error": str(e)[:300]}))
 
 
+def ensure_cover_applio():
+    if not APPLIO_COVER_DIR.exists():
+        raise RuntimeError(f"Cover applio directory not found: {APPLIO_COVER_DIR}")
+    infer_py = APPLIO_COVER_DIR / "rvc" / "infer" / "infer.py"
+    if not infer_py.exists():
+        raise RuntimeError(f"Cover applio infer.py not found: {infer_py}")
+
+    cfg_dir = APPLIO_COVER_DIR / "rvc" / "configs"
+    required = [
+        cfg_dir / "v1" / "32000.json",
+        cfg_dir / "v1" / "40000.json",
+        cfg_dir / "v1" / "48000.json",
+        cfg_dir / "v2" / "32000.json",
+        cfg_dir / "v2" / "40000.json",
+        cfg_dir / "v2" / "48000.json",
+    ]
+    missing = [str(p) for p in required if not p.exists() or p.stat().st_size <= 0]
+    if missing:
+        raise RuntimeError("Cover applio config files missing: " + ", ".join(missing))
+
+
+def force_cover_applio_precision(preferred: str) -> str:
+    ensure_cover_applio()
+    requested = normalize_precision(preferred)
+
+    if requested == "fp32":
+        effective = "fp32"
+        fallback_reason = None
+    else:
+        fp16_supported = _TORCH_AVAILABLE and torch is not None and bool(torch.cuda.is_available())
+        effective = "fp16" if fp16_supported else "fp32"
+        fallback_reason = None
+        if requested == "bf16":
+            fallback_reason = "bf16_not_supported_in_cover_applio"
+        if not fp16_supported:
+            fallback_reason = "fp16_not_supported"
+
+    fp16_run = effective == "fp16"
+    cfg_dir = APPLIO_COVER_DIR / "rvc" / "configs"
+    targets = [
+        cfg_dir / "v1" / "32000.json",
+        cfg_dir / "v1" / "40000.json",
+        cfg_dir / "v1" / "48000.json",
+        cfg_dir / "v2" / "32000.json",
+        cfg_dir / "v2" / "40000.json",
+        cfg_dir / "v2" / "48000.json",
+    ]
+    for p in targets:
+        try:
+            cfg = json.loads(p.read_text(encoding="utf-8"))
+        except Exception:
+            cfg = {}
+        train_cfg = cfg.get("train")
+        if not isinstance(train_cfg, dict):
+            train_cfg = {}
+            cfg["train"] = train_cfg
+        train_cfg["fp16_run"] = fp16_run
+        p.write_text(json.dumps(cfg, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+    print(
+        json.dumps(
+            {
+                "event": "cover_precision_forced",
+                "requested": requested,
+                "effective": effective,
+                "configRoot": str(cfg_dir),
+                "fallbackReason": fallback_reason,
+            }
+        )
+    )
+    return effective
+
+
 def download_file_http(
     url: str,
     dest: Path,
@@ -803,12 +878,12 @@ def get_voice_converter():
     if _VOICE_CONVERTER_INSTANCE is not None:
         return _VOICE_CONVERTER_INSTANCE
 
-    ensure_applio()
-    applio_path = str(APPLIO_DIR)
-    if applio_path not in sys.path:
-        sys.path.append(applio_path)
-    with pushd(APPLIO_DIR):
-        from rvc.infer.infer import VoiceConverter  # type: ignore
+    ensure_cover_applio()
+    cover_root = str(APPLIO_COVER_ROOT)
+    if cover_root not in sys.path:
+        sys.path.append(cover_root)
+    with pushd(APPLIO_COVER_ROOT):
+        from programs.applio_code.rvc.infer.infer import VoiceConverter  # type: ignore
 
         _VOICE_CONVERTER_INSTANCE = VoiceConverter()
     return _VOICE_CONVERTER_INSTANCE
@@ -1081,6 +1156,8 @@ def recover_rvc_output(
     for root in (
         output_audio_path.parent,
         input_audio_path.parent,
+        APPLIO_COVER_ROOT,
+        APPLIO_COVER_DIR,
         APPLIO_DIR,
         APPLIO_DIR / "assets",
         APPLIO_DIR / "outputs",
@@ -1120,7 +1197,7 @@ def recover_rvc_output(
     stem = output_audio_path.stem.lower()
     recent = []
     try:
-        for p in APPLIO_DIR.rglob("*"):
+        for p in APPLIO_COVER_ROOT.rglob("*"):
             if not p.is_file():
                 continue
             suffix = p.suffix.lower()
@@ -1159,7 +1236,7 @@ def recover_rvc_output(
     # Final fallback: any very recent audio file created during conversion.
     recent_any = []
     try:
-        for root in (output_audio_path.parent, input_audio_path.parent, APPLIO_DIR):
+        for root in (output_audio_path.parent, input_audio_path.parent, APPLIO_COVER_ROOT, APPLIO_DIR):
             if not root.exists():
                 continue
             for p in root.rglob("*"):
@@ -1265,7 +1342,7 @@ def convert_with_rvc(
 
         try:
             vc = get_voice_converter()
-            with pushd(APPLIO_DIR):
+            with pushd(APPLIO_COVER_ROOT):
                 vc.convert_audio(
                     audio_input_path=str(attempt_input_path),
                     audio_output_path=str(output_audio_path),
@@ -1454,7 +1531,7 @@ def handle_infer_job(job: dict, inp: dict, client, bucket: str):
     instrumental_pitch = clamp_int(as_int(rvc_cfg.get("pitch"), 0), -24, 24)
 
     infer_precision = os.environ.get("APPLIO_INFER_PRECISION", "fp16").strip().lower()
-    force_applio_precision(infer_precision)
+    force_cover_applio_precision(infer_precision)
 
     gpu = get_gpu_diagnostics()
     print(json.dumps({"event": "infer_gpu_diagnostics", **gpu}))
@@ -1715,6 +1792,7 @@ def handler(job):
     log_runtime_dependency_info()
 
     ensure_applio()
+    ensure_cover_applio()
     validate_forced_sample_rate()
 
     bucket = require_env("R2_BUCKET")
