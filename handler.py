@@ -39,7 +39,7 @@ WORK_DIR = Path("/workspace")
 PREREQ_MARKER = APPLIO_DIR / ".prerequisites_ready"
 MUSIC_SEPARATION_DIR = Path("/app/music_separation_code")
 MUSIC_MODELS_DIR = Path("/app/music_separation_models")
-RUNNER_BUILD = "stemflow-20260223-infer-phase2-v3"
+RUNNER_BUILD = "stemflow-20260223-infer-phase2-v4"
 
 # Always use these advanced pretrained weights (32k).
 # Downloaded on demand and cached per worker at /content/Applio/pretrained_custom/*.pth
@@ -870,6 +870,27 @@ def find_stem_file(store_dir: Path, contains: str):
     return None
 
 
+def find_karaoke_vocal_stem(store_dir: Path):
+    files = sorted(store_dir.glob("*.flac"), key=lambda p: p.stat().st_mtime, reverse=True)
+    if not files:
+        return None
+
+    preferred_tokens = ("_karaoke", "karaoke", "_vocals", "vocals")
+    for token in preferred_tokens:
+        for f in files:
+            name = f.name.lower()
+            if "instrumental" in name:
+                continue
+            if token in name:
+                return f
+
+    # Fallback: first non-instrumental stem.
+    for f in files:
+        if "instrumental" not in f.name.lower():
+            return f
+    return None
+
+
 def find_latest_stem_file(store_dir: Path):
     files = sorted(store_dir.glob("*.flac"), key=lambda p: p.stat().st_mtime, reverse=True)
     return files[0] if files else None
@@ -1016,6 +1037,7 @@ def convert_with_rvc(
     probe_candidates = []
     for root in (
         output_audio_path.parent,
+        input_audio_path.parent,
         APPLIO_DIR,
         APPLIO_DIR / "assets",
         APPLIO_DIR / "outputs",
@@ -1080,6 +1102,46 @@ def convert_with_rvc(
             json.dumps(
                 {
                     "event": "infer_rvc_output_recovered_recent",
+                    "from": str(cand),
+                    "to": str(output_audio_path),
+                    "bytes": output_audio_path.stat().st_size if output_audio_path.exists() else None,
+                }
+            )
+        )
+        if output_audio_path.exists() and output_audio_path.stat().st_size > 0:
+            return
+
+    # Final fallback: any very recent audio file created during conversion.
+    recent_any = []
+    try:
+        for root in (output_audio_path.parent, input_audio_path.parent, APPLIO_DIR):
+            if not root.exists():
+                continue
+            for p in root.rglob("*"):
+                if not p.is_file():
+                    continue
+                suffix = p.suffix.lower()
+                if suffix not in exts:
+                    continue
+                if p.resolve() == input_audio_path.resolve():
+                    continue
+                st = p.stat()
+                if st.st_size <= 0:
+                    continue
+                if st.st_mtime < (started_at - 3):
+                    continue
+                recent_any.append((st.st_mtime, st.st_size, p))
+        recent_any.sort(key=lambda x: (x[0], x[1]), reverse=True)
+    except Exception:
+        recent_any = []
+
+    if recent_any:
+        cand = recent_any[0][2]
+        shutil.copyfile(cand, output_audio_path)
+        print(
+            json.dumps(
+                {
+                    "event": "infer_rvc_output_recovered_any_recent",
                     "from": str(cand),
                     "to": str(output_audio_path),
                     "bytes": output_audio_path.stat().st_size if output_audio_path.exists() else None,
@@ -1289,22 +1351,41 @@ def handle_infer_job(job: dict, inp: dict, client, bucket: str):
         ckpt_path=model_defs["karaoke"]["ckpt"],
         use_tta=use_tta,
     )
-    backing_stem = find_stem_file(stems_karaoke_dir, "_instrumental")
+    # Keep chain aligned with reference cover maker:
+    # vocals -> karaoke vocal -> dereverb -> deecho -> RVC
+    karaoke_vocal_stem = find_karaoke_vocal_stem(stems_karaoke_dir)
+    backing_stem = find_stem_file(stems_karaoke_dir, "_instrumental") or find_stem_file(
+        stems_karaoke_dir, "instrumental"
+    )
+    if not karaoke_vocal_stem:
+        raise RuntimeError(
+            "Could not find karaoke vocal stem after karaoke separation "
+            "(expected a non-instrumental stem)."
+        )
     if not backing_stem:
         print(
             json.dumps(
                 {
                     "event": "infer_separation_backing_warn",
                     "message": "backing stem missing, continuing without backing",
+                    "karaokeVocalStem": karaoke_vocal_stem.name,
                 }
             )
         )
     else:
-        print(json.dumps({"event": "infer_separation_backing_done", "backingStem": backing_stem.name}))
+        print(
+            json.dumps(
+                {
+                    "event": "infer_separation_backing_done",
+                    "karaokeVocalStem": karaoke_vocal_stem.name,
+                    "backingStem": backing_stem.name,
+                }
+            )
+        )
 
     print(json.dumps({"event": "infer_dereverb_start", "model": INFER_FIXED_DEREVERB_MODEL}))
     dereverb_stem = run_uvr_single_stem(
-        input_path=vocals_stem,
+        input_path=karaoke_vocal_stem,
         store_dir=stems_dereverb_dir,
         model_filename=UVR_MODEL_FILE_DEREVERB,
         output_single_stem="No Reverb",
@@ -1333,7 +1414,19 @@ def handle_infer_job(job: dict, inp: dict, client, bucket: str):
         index_path=index_path,
         rvc_cfg=rvc_cfg,
     )
-    print(json.dumps({"event": "infer_rvc_main_done", "output": converted_main_vocals.name}))
+    if not converted_main_vocals.exists() or converted_main_vocals.stat().st_size <= 0:
+        raise RuntimeError(
+            f"RVC main vocal output missing after conversion: {converted_main_vocals}"
+        )
+    print(
+        json.dumps(
+            {
+                "event": "infer_rvc_main_done",
+                "output": converted_main_vocals.name,
+                "bytes": converted_main_vocals.stat().st_size,
+            }
+        )
+    )
 
     final_backing_stem = None
     if add_back_vocals and backing_stem:
