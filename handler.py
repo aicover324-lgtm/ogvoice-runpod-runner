@@ -41,7 +41,7 @@ WORK_DIR = Path("/workspace")
 PREREQ_MARKER = APPLIO_DIR / ".prerequisites_ready"
 MUSIC_SEPARATION_DIR = Path("/app/music_separation_code")
 MUSIC_MODELS_DIR = Path("/app/music_separation_models")
-RUNNER_BUILD = "stemflow-20260223-infer-phase2-v8"
+RUNNER_BUILD = "stemflow-20260223-infer-phase2-v9"
 
 # Always use these advanced pretrained weights (32k).
 # Downloaded on demand and cached per worker at /content/Applio/pretrained_custom/*.pth
@@ -113,6 +113,10 @@ KARAOKE_MODEL_CKPT_URL = "https://huggingface.co/shiromiya/audio-separation-mode
 UVR_MODEL_FILE_DEREVERB = "UVR-DeEcho-DeReverb.pth"
 UVR_MODEL_FILE_DEECHO = "UVR-De-Echo-Normal.pth"
 UVR_MODELS_DIR = MUSIC_MODELS_DIR / "uvr"
+
+COVER_RESOURCES_BASE_URL = "https://huggingface.co/IAHispano/Applio/resolve/main/Resources"
+COVER_RMVPE_URL = f"{COVER_RESOURCES_BASE_URL}/predictors/rmvpe.pt"
+COVER_FCPE_URL = f"{COVER_RESOURCES_BASE_URL}/predictors/fcpe.pt"
 
 INFER_FIXED_VOCALS_MODEL = "Mel-Roformer"
 INFER_FIXED_KARAOKE_MODEL = "Mel-Roformer Karaoke"
@@ -506,11 +510,45 @@ def ensure_applio():
 def ensure_cover_applio():
     if not APPLIO_COVER_DIR.exists():
         raise RuntimeError(f"Cover applio directory not found: {APPLIO_COVER_DIR}")
-    infer_py = APPLIO_COVER_DIR / "rvc" / "infer" / "infer.py"
+    cover_rvc = APPLIO_COVER_DIR / "rvc"
+    infer_py = cover_rvc / "infer" / "infer.py"
     if not infer_py.exists():
         raise RuntimeError(f"Cover applio infer.py not found: {infer_py}")
 
-    cfg_dir = APPLIO_COVER_DIR / "rvc" / "configs"
+    # Force /app/rvc to point to cover applio rvc so relative "rvc/..." paths resolve correctly.
+    app_rvc_alias = APPLIO_COVER_ROOT / "rvc"
+    alias_ok = False
+    try:
+        if app_rvc_alias.exists() or app_rvc_alias.is_symlink():
+            if app_rvc_alias.is_symlink() and app_rvc_alias.resolve() == cover_rvc.resolve():
+                alias_ok = True
+            elif app_rvc_alias.resolve() == cover_rvc.resolve():
+                alias_ok = True
+    except Exception:
+        alias_ok = False
+
+    if not alias_ok:
+        try:
+            if app_rvc_alias.is_symlink() or app_rvc_alias.is_file():
+                app_rvc_alias.unlink()
+            elif app_rvc_alias.exists() and app_rvc_alias.is_dir():
+                shutil.rmtree(app_rvc_alias, ignore_errors=True)
+            app_rvc_alias.symlink_to(cover_rvc, target_is_directory=True)
+            print(
+                json.dumps(
+                    {
+                        "event": "cover_rvc_alias_created",
+                        "alias": str(app_rvc_alias),
+                        "target": str(cover_rvc),
+                    }
+                )
+            )
+        except Exception as e:
+            raise RuntimeError(
+                f"Failed to create cover rvc alias {app_rvc_alias} -> {cover_rvc}: {e}"
+            ) from e
+
+    cfg_dir = cover_rvc / "configs"
     required = [
         cfg_dir / "v1" / "32000.json",
         cfg_dir / "v1" / "40000.json",
@@ -522,6 +560,16 @@ def ensure_cover_applio():
     missing = [str(p) for p in required if not p.exists() or p.stat().st_size <= 0]
     if missing:
         raise RuntimeError("Cover applio config files missing: " + ", ".join(missing))
+
+    predictors_dir = cover_rvc / "models" / "predictors"
+    rmvpe_path = predictors_dir / "rmvpe.pt"
+    fcpe_path = predictors_dir / "fcpe.pt"
+    if not rmvpe_path.exists() or rmvpe_path.stat().st_size < 1_000_000:
+        download_file_http(COVER_RMVPE_URL, rmvpe_path, retries=3, timeout_sec=180, min_bytes=1_000_000)
+        print(json.dumps({"event": "cover_predictor_ready", "name": "rmvpe", "path": str(rmvpe_path)}))
+    if not fcpe_path.exists() or fcpe_path.stat().st_size < 1_000_000:
+        download_file_http(COVER_FCPE_URL, fcpe_path, retries=3, timeout_sec=180, min_bytes=1_000_000)
+        print(json.dumps({"event": "cover_predictor_ready", "name": "fcpe", "path": str(fcpe_path)}))
 
 
 def force_cover_applio_precision(preferred: str) -> str:
