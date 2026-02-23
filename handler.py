@@ -690,16 +690,14 @@ def normalize_rvc_config(raw: dict):
         # Keep split enabled in cover mode for better consistency on long inputs.
         "splitAudio": True,
         "autotune": False,
-        "inferBackingVocals": as_bool(raw.get("inferBackingVocals"), False),
+        "inferBackingVocals": False,
     }
 
 
 def normalize_audio_separation_config(raw: dict):
-    back_mode_raw = str(raw.get("backVocalMode") or "").strip().lower()
-    back_mode = "convert" if back_mode_raw == "convert" else "do_not_convert"
     return {
         "addBackVocals": as_bool(raw.get("addBackVocals"), False),
-        "backVocalMode": back_mode,
+        "backVocalMode": "do_not_convert",
         "useTta": False,
         "batchSize": 1,
         "vocalsModel": INFER_FIXED_VOCALS_MODEL,
@@ -1097,10 +1095,6 @@ def handle_infer_job(job: dict, inp: dict, client, bucket: str):
     stem_keys = normalize_stem_keys(as_dict(inp.get("stemKeys")))
 
     add_back_vocals = as_bool(sep_cfg.get("addBackVocals"), False)
-    convert_back_vocals = (
-        str(sep_cfg.get("backVocalMode") or "").strip().lower() == "convert"
-        or as_bool(rvc_cfg.get("inferBackingVocals"), False)
-    ) and add_back_vocals
     use_tta = as_bool(sep_cfg.get("useTta"), INFER_DEFAULT_USE_TTA)
     batch_size = clamp_int(as_int(sep_cfg.get("batchSize"), INFER_DEFAULT_BATCH_SIZE), 1, 24)
     instrumental_pitch = clamp_int(as_int(rvc_cfg.get("pitch"), 0), -24, 24)
@@ -1172,22 +1166,27 @@ def handle_infer_job(job: dict, inp: dict, client, bucket: str):
         raise RuntimeError("Could not find separated vocals/instrumental stems.")
     print(json.dumps({"event": "infer_separation_vocals_done", "vocalsStem": vocals_stem.name, "instrumentalStem": instrumental_stem.name}))
 
-    backing_stem = None
-    if add_back_vocals:
-        print(json.dumps({"event": "infer_separation_backing_start"}))
-        run_music_separation(
-            input_path=vocals_stem,
-            store_dir=stems_karaoke_dir,
-            model_type=model_defs["karaoke"]["model_type"],
-            config_path=model_defs["karaoke"]["config"],
-            ckpt_path=model_defs["karaoke"]["ckpt"],
-            use_tta=use_tta,
+    print(json.dumps({"event": "infer_separation_backing_start"}))
+    run_music_separation(
+        input_path=vocals_stem,
+        store_dir=stems_karaoke_dir,
+        model_type=model_defs["karaoke"]["model_type"],
+        config_path=model_defs["karaoke"]["config"],
+        ckpt_path=model_defs["karaoke"]["ckpt"],
+        use_tta=use_tta,
+    )
+    backing_stem = find_stem_file(stems_karaoke_dir, "_instrumental")
+    if not backing_stem:
+        print(
+            json.dumps(
+                {
+                    "event": "infer_separation_backing_warn",
+                    "message": "backing stem missing, continuing without backing",
+                }
+            )
         )
-        backing_stem = find_stem_file(stems_karaoke_dir, "_instrumental")
-        if not backing_stem:
-            print(json.dumps({"event": "infer_separation_backing_warn", "message": "backing stem missing, continuing without backing"}))
-        else:
-            print(json.dumps({"event": "infer_separation_backing_done", "backingStem": backing_stem.name}))
+    else:
+        print(json.dumps({"event": "infer_separation_backing_done", "backingStem": backing_stem.name}))
 
     print(json.dumps({"event": "infer_dereverb_start", "model": INFER_FIXED_DEREVERB_MODEL}))
     dereverb_stem = run_uvr_single_stem(
@@ -1222,19 +1221,31 @@ def handle_infer_job(job: dict, inp: dict, client, bucket: str):
     )
     print(json.dumps({"event": "infer_rvc_main_done", "output": converted_main_vocals.name}))
 
-    final_backing_stem = backing_stem
-    if convert_back_vocals and backing_stem:
-        converted_backing = output_dir / "back_vocals_converted.wav"
-        print(json.dumps({"event": "infer_rvc_backing_start"}))
-        convert_with_rvc(
-            input_audio_path=backing_stem,
-            output_audio_path=converted_backing,
-            model_path=model_path,
-            index_path=index_path,
-            rvc_cfg=rvc_cfg,
+    final_backing_stem = None
+    if add_back_vocals and backing_stem:
+        backing_for_mix = output_dir / "backing_pitch_shifted.flac"
+        print(
+            json.dumps(
+                {
+                    "event": "infer_backing_pitch_shift_start",
+                    "semitones": instrumental_pitch,
+                }
+            )
         )
-        final_backing_stem = converted_backing
-        print(json.dumps({"event": "infer_rvc_backing_done", "output": converted_backing.name}))
+        shift_audio_pitch_to_semitones(
+            input_path=backing_stem,
+            output_path=backing_for_mix,
+            semitones=instrumental_pitch,
+        )
+        final_backing_stem = backing_for_mix
+        print(
+            json.dumps(
+                {
+                    "event": "infer_backing_pitch_shift_done",
+                    "output": backing_for_mix.name,
+                }
+            )
+        )
 
     instrumental_for_mix = instrumental_stem
     if instrumental_pitch != 0:
