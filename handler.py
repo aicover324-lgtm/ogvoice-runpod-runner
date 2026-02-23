@@ -176,7 +176,7 @@ def as_bool(v, default=False) -> bool:
 
 
 INFER_STEM_OUTPUT_FLAC = as_bool(os.environ.get("INFER_STEM_OUTPUT_FLAC"), False)
-INFER_STEM_CACHE_ENABLED = as_bool(os.environ.get("INFER_STEM_CACHE_ENABLED"), True)
+INFER_STEM_CACHE_ENABLED = as_bool(os.environ.get("INFER_STEM_CACHE_ENABLED"), False)
 INFER_STEM_CACHE_UPLOAD_ENABLED = as_bool(os.environ.get("INFER_STEM_CACHE_UPLOAD_ENABLED"), True)
 AUDIO_SEPARATOR_VR_BATCH_SIZE = env_int("AUDIO_SEPARATOR_VR_BATCH_SIZE", 1)
 AUDIO_SEPARATOR_ENABLE_TTA = as_bool(os.environ.get("AUDIO_SEPARATOR_ENABLE_TTA"), False)
@@ -1864,8 +1864,7 @@ def handle_infer_job(job, inp, bucket: str, client, effective_precision: str):
         instrumental_pitch = 24
 
     index_rate = _clamp(as_float(inp.get("searchFeatureRatio"), 0.75), 0.0, 1.0)
-    split_audio = as_bool(inp.get("splitAudio"), True)
-
+    split_audio = as_bool(inp.get("splitAudio"), False)
     protect = _clamp(as_float(inp.get("protect"), 0.33), 0.0, 0.5)
     f0_method = str(inp.get("f0Method") or "rmvpe")
     embedder_model = str(inp.get("embedderModel") or "contentvec")
@@ -1876,19 +1875,10 @@ def handle_infer_job(job, inp, bucket: str, client, effective_precision: str):
     add_back_vocals = as_bool(inp.get("addBackVocals"), False)
     convert_back_vocals = as_bool(inp.get("convertBackVocals"), False)
     mix_with_input = as_bool(inp.get("mixWithInput"), True)
-    require_gpu_requested = as_bool(inp.get("requireGpu"), True)
-    require_gpu = True
+    deecho_enabled = as_bool(inp.get("deechoEnabled"), True)
 
-    dereverb_model_requested = str(
-        inp.get("dereverbModel")
-        or DEFAULT_DEREVERB_MODEL_NAME
-    ).strip()
-    deecho_model_requested = str(
-        inp.get("deechoModel")
-        or DEFAULT_DEECHO_MODEL_NAME
-    ).strip()
-    dereverb_model = resolve_uvr_model("dereverb", dereverb_model_requested)
-    deecho_model = resolve_uvr_model("deecho", deecho_model_requested)
+    dereverb_model = resolve_uvr_model("dereverb", str(inp.get("dereverbModel") or DEFAULT_DEREVERB_MODEL_NAME))
+    deecho_model = resolve_uvr_model("deecho", str(inp.get("deechoModel") or DEFAULT_DEECHO_MODEL_NAME))
 
     vocal_sep_model = str(
         inp.get("vocalStemModel")
@@ -1905,30 +1895,21 @@ def handle_infer_job(job, inp, bucket: str, client, effective_precision: str):
 
     req_id = (job or {}).get("id", "infer")
     work = WORK_DIR / f"infer_{str(req_id)[:12]}"
+    if work.exists():
+        shutil.rmtree(work, ignore_errors=True)
     work.mkdir(parents=True, exist_ok=True)
     infer_started_at = time.time()
 
     input_suffix = Path(str(input_key)).suffix or ".wav"
     input_path = work / f"input_audio{input_suffix}"
+    model_zip = work / "model.zip"
+    model_dir = work / "model"
     output_path = work / "converted.wav"
 
     gpu = get_gpu_diagnostics()
     print(json.dumps({"event": "gpu_diagnostics", **gpu}))
-    if not require_gpu_requested:
-        print(
-            json.dumps(
-                {
-                    "event": "infer_require_gpu_forced",
-                    "requested": False,
-                    "using": True,
-                }
-            )
-        )
     if not gpu.get("cudaAvailable"):
-        raise RuntimeError(
-            "CUDA is not available in this worker. "
-            "GPU is required for inference; CPU fallback is disabled."
-        )
+        raise RuntimeError("CUDA is not available in this worker. GPU is required for inference.")
 
     print(
         json.dumps(
@@ -1947,174 +1928,60 @@ def handle_infer_job(job, inp, bucket: str, client, effective_precision: str):
                 "addBackVocals": add_back_vocals,
                 "convertBackVocals": convert_back_vocals,
                 "mixWithInput": mix_with_input,
+                "deechoEnabled": deecho_enabled,
                 "vocalSepModel": vocal_sep_model,
                 "karaokeSepModel": karaoke_sep_model,
                 "dereverbModel": dereverb_model["name"],
                 "deechoModel": deecho_model["name"],
                 "precision": effective_precision,
-                "stemOutputFlac": INFER_STEM_OUTPUT_FLAC,
-                "stemCacheEnabled": INFER_STEM_CACHE_ENABLED,
-                "stemCacheUploadEnabled": INFER_STEM_CACHE_UPLOAD_ENABLED,
-                "stemCachePrefix": INFER_STEM_CACHE_PREFIX,
-                "splitAudioForceAtSeconds": INFER_SPLIT_AUDIO_FORCE_AT_SECONDS,
-                "stemTimeoutSec": INFER_STEM_TIMEOUT_SEC,
-                "inferTimeoutSec": INFER_RVC_TIMEOUT_SEC,
-                "mixTimeoutSec": INFER_MIX_TIMEOUT_SEC,
             }
         )
     )
 
-    model_resolve_started = time.time()
-    model_info = resolve_infer_model_files(client=client, bucket=bucket, model_key=model_key, work=work)
-    model_files = {
-        "pth": model_info["pth"],
-        "index": model_info["index"],
-    }
-    model_resolve_duration_sec = max(0.0, time.time() - model_resolve_started)
-    print(
-        json.dumps(
-            {
-                "event": "infer_model_ready",
-                "cache": model_info.get("cache"),
-                "cacheSlot": model_info.get("cacheSlot"),
-                "durationSec": round(model_resolve_duration_sec, 3),
-            }
-        )
-    )
+    try:
+        print(json.dumps({"event": "infer_download_model_start", "key": model_key}))
+        client.download_file(bucket, model_key, str(model_zip))
+        print(json.dumps({"event": "infer_download_model_done", "bytes": model_zip.stat().st_size}))
+    except ClientError as e:
+        raise RuntimeError(f"Failed to download model zip: s3://{bucket}/{model_key}\n{e}") from e
 
-    input_download_started = time.time()
-    input_download_duration_sec = 0.0
+    model_files = extract_model_artifact(model_zip, model_dir)
+
     try:
         print(json.dumps({"event": "infer_download_input_start", "key": input_key}))
         client.download_file(bucket, input_key, str(input_path))
         if not input_path.exists() or input_path.stat().st_size == 0:
             raise RuntimeError("Input audio file is missing or empty after download.")
-        input_download_duration_sec = max(0.0, time.time() - input_download_started)
-        print(
-            json.dumps(
-                {
-                    "event": "infer_download_input_done",
-                    "bytes": input_path.stat().st_size,
-                    "durationSec": round(input_download_duration_sec, 3),
-                }
-            )
-        )
+        print(json.dumps({"event": "infer_download_input_done", "bytes": input_path.stat().st_size}))
     except ClientError as e:
         raise RuntimeError(f"Failed to download input audio: s3://{bucket}/{input_key}\n{e}") from e
 
-    input_audio_info = probe_audio(input_path)
-    print(json.dumps({"event": "infer_audio_probe", **input_audio_info}))
-    input_duration_sec = input_audio_info.get("durationSec")
-    if (
-        not split_audio
-        and isinstance(input_duration_sec, (int, float))
-        and float(input_duration_sec) >= float(INFER_SPLIT_AUDIO_FORCE_AT_SECONDS)
-    ):
-        split_audio = True
-        print(
-            json.dumps(
-                {
-                    "event": "infer_split_audio_forced",
-                    "reason": "duration_threshold",
-                    "durationSec": round(float(input_duration_sec), 3),
-                    "thresholdSec": INFER_SPLIT_AUDIO_FORCE_AT_SECONDS,
-                }
-            )
-        )
-
-    input_fingerprint = None
-    input_fingerprint_duration_sec = 0.0
-    main_stem_cache_prefix = None
-    main_stem_cache_status = "disabled"
-    main_cache_lookup_duration_sec = 0.0
-    main_cache_upload_duration_sec = 0.0
-    main_cache_lookup = {"used": False, "vocals": None, "instrumental": None}
-
     stems_root = work / "stems"
-    if INFER_STEM_CACHE_ENABLED:
-        fingerprint_started = time.time()
-        input_fingerprint = sha1_file_hex(input_path)
-        input_fingerprint_duration_sec = max(0.0, time.time() - fingerprint_started)
-        print(
-            json.dumps(
-                {
-                    "event": "infer_input_fingerprint",
-                    "sha1": input_fingerprint,
-                    "durationSec": round(input_fingerprint_duration_sec, 3),
-                }
-            )
-        )
 
-        main_stem_cache_prefix = build_main_stem_cache_prefix(
-            input_sha1=input_fingerprint,
-            model_id=STEM_MODEL_SPECS["vocals"]["id"],
-            user_scope=user_scope_from_input_key(input_key),
-        )
-        main_stem_cache_status = "miss"
-        cache_lookup_started = time.time()
-        main_cache_lookup = restore_main_stem_cache_if_exists(
-            client=client,
-            bucket=bucket,
-            cache_prefix=main_stem_cache_prefix,
-            dest_dir=stems_root / "main_cache",
-        )
-        main_cache_lookup_duration_sec = max(0.0, time.time() - cache_lookup_started)
-        if main_cache_lookup.get("used"):
-            main_stem_cache_status = "hit"
-
-    main_sep_duration_sec = 0.0
-    main_stems = None
-    if main_cache_lookup.get("used"):
-        lead_source = Path(str(main_cache_lookup["vocals"]))
-        instrumental_source = Path(str(main_cache_lookup["instrumental"]))
-        main_model_used = STEM_MODEL_SPECS["vocals"]["name"]
-    else:
-        print(json.dumps({"event": "stem_separation_main_start", "model": vocal_sep_model}))
-        main_sep_started = time.time()
-        main_stems = separate_vocals_and_instrumental(
-            input_audio=input_path,
-            out_dir=stems_root / "main",
-            model_filename=vocal_sep_model,
-            vocals_name="main_vocals",
-            instrumental_name="instrumental",
-        )
-        main_sep_duration_sec = max(0.0, time.time() - main_sep_started)
-        main_model_used = main_stems.get("modelUsed")
-        lead_source = main_stems["vocals"]
-        instrumental_source = main_stems["instrumental"]
-
-        if main_stem_cache_prefix:
-            cache_upload_started = time.time()
-            upload_main_stem_cache_best_effort(
-                client=client,
-                bucket=bucket,
-                cache_prefix=main_stem_cache_prefix,
-                vocals_path=lead_source,
-                instrumental_path=instrumental_source,
-                meta={
-                    "inputKey": input_key,
-                    "model": vocal_sep_model,
-                    "inputDurationSec": input_duration_sec,
-                },
-            )
-            main_cache_upload_duration_sec = max(0.0, time.time() - cache_upload_started)
-
+    print(json.dumps({"event": "stem_separation_main_start", "model": vocal_sep_model}))
+    main_sep_started = time.time()
+    main_stems = separate_vocals_and_instrumental(
+        input_audio=input_path,
+        out_dir=stems_root / "main",
+        model_filename=vocal_sep_model,
+        vocals_name="main_vocals",
+        instrumental_name="instrumental",
+    )
+    main_sep_duration_sec = max(0.0, time.time() - main_sep_started)
+    lead_source = main_stems["vocals"]
+    instrumental_source = main_stems["instrumental"]
     print(
         json.dumps(
             {
                 "event": "stem_separation_main_done",
                 "leadSource": str(lead_source),
                 "instrumentalSource": str(instrumental_source),
-                "modelUsed": main_model_used,
+                "modelUsed": main_stems.get("modelUsed"),
                 "durationSec": round(main_sep_duration_sec, 3),
-                "cacheStatus": main_stem_cache_status,
             }
         )
     )
 
-    backing_source = None
-    backing_model_used = None
-    backing_sep_duration_sec = 0.0
     print(json.dumps({"event": "stem_separation_backing_start", "model": karaoke_sep_model}))
     backing_sep_started = time.time()
     backing_stems = separate_vocals_and_instrumental(
@@ -2125,7 +1992,6 @@ def handle_infer_job(job, inp, bucket: str, client, effective_precision: str):
         instrumental_name="backing_vocals",
     )
     backing_sep_duration_sec = max(0.0, time.time() - backing_sep_started)
-    backing_model_used = backing_stems.get("modelUsed")
     lead_source = backing_stems["vocals"]
     backing_source = backing_stems["instrumental"]
     print(
@@ -2134,23 +2000,13 @@ def handle_infer_job(job, inp, bucket: str, client, effective_precision: str):
                 "event": "stem_separation_backing_done",
                 "leadSource": str(lead_source),
                 "backingSource": str(backing_source),
-                "modelUsed": backing_model_used,
+                "modelUsed": backing_stems.get("modelUsed"),
                 "durationSec": round(backing_sep_duration_sec, 3),
             }
         )
     )
 
-    dereverb_duration_sec = 0.0
-    print(
-        json.dumps(
-            {
-                "event": "stem_clean_dereverb_start",
-                "model": dereverb_model["name"],
-                "input": str(lead_source),
-            }
-        )
-    )
-    dereverb_started = time.time()
+    print(json.dumps({"event": "stem_clean_dereverb_start", "model": dereverb_model["name"], "input": str(lead_source)}))
     lead_source = run_uvr_single_stem(
         input_audio=lead_source,
         out_dir=stems_root / "dereverb",
@@ -2158,63 +2014,21 @@ def handle_infer_job(job, inp, bucket: str, client, effective_precision: str):
         model_file=dereverb_model["file"],
         output_single_stem="No Reverb",
     )
-    dereverb_duration_sec = max(0.0, time.time() - dereverb_started)
-    print(
-        json.dumps(
-            {
-                "event": "stem_clean_dereverb_done",
-                "output": str(lead_source),
-                "durationSec": round(dereverb_duration_sec, 3),
-            }
-        )
-    )
+    print(json.dumps({"event": "stem_clean_dereverb_done", "output": str(lead_source)}))
 
-    deecho_duration_sec = 0.0
-    print(
-        json.dumps(
-            {
-                "event": "stem_clean_deecho_start",
-                "model": deecho_model["name"],
-                "input": str(lead_source),
-            }
+    if deecho_enabled:
+        print(json.dumps({"event": "stem_clean_deecho_start", "model": deecho_model["name"], "input": str(lead_source)}))
+        lead_source = run_uvr_single_stem(
+            input_audio=lead_source,
+            out_dir=stems_root / "deecho",
+            stage="deecho",
+            model_file=deecho_model["file"],
+            output_single_stem="No Echo",
         )
-    )
-    deecho_started = time.time()
-    lead_source = run_uvr_single_stem(
-        input_audio=lead_source,
-        out_dir=stems_root / "deecho",
-        stage="deecho",
-        model_file=deecho_model["file"],
-        output_single_stem="No Echo",
-    )
-    deecho_duration_sec = max(0.0, time.time() - deecho_started)
-    print(
-        json.dumps(
-            {
-                "event": "stem_clean_deecho_done",
-                "output": str(lead_source),
-                "durationSec": round(deecho_duration_sec, 3),
-            }
-        )
-    )
+        print(json.dumps({"event": "stem_clean_deecho_done", "output": str(lead_source)}))
 
-    lead_rvc_input = normalize_audio_to_wav(
-        src_path=lead_source,
-        out_path=work / "lead_for_rvc.wav",
-    )
-    print(
-        json.dumps(
-            {
-                "event": "infer_rvc_input_normalized",
-                "role": "main",
-                "src": str(lead_source),
-                "normalized": str(lead_rvc_input),
-            }
-        )
-    )
-
+    lead_rvc_input = normalize_audio_to_wav(src_path=lead_source, out_path=work / "lead_for_rvc.wav")
     print(json.dumps({"event": "infer_convert_main_start", "input": str(lead_rvc_input)}))
-    main_infer_started = time.time()
     lead_converted = run_rvc_infer_file(
         input_audio=lead_rvc_input,
         output_wav=output_path,
@@ -2227,44 +2041,16 @@ def handle_infer_job(job, inp, bucket: str, client, effective_precision: str):
         export_format=export_format,
         embedder_model=embedder_model,
     )
-    main_infer_duration_sec = max(0.0, time.time() - main_infer_started)
-    print(
-        json.dumps(
-            {
-                "event": "infer_convert_main_done",
-                "output": str(lead_converted),
-                "durationSec": round(main_infer_duration_sec, 3),
-            }
-        )
-    )
+    print(json.dumps({"event": "infer_convert_main_done", "output": str(lead_converted)}))
 
     backing_for_mix = None
-    backing_infer_duration_sec = 0.0
-    backing_pitch_shift_duration_sec = 0.0
     if add_back_vocals:
-        if backing_source is None:
-            raise RuntimeError("Backing vocal stem is missing.")
         if convert_back_vocals:
-            backing_rvc_input = normalize_audio_to_wav(
-                src_path=backing_source,
-                out_path=work / "backing_for_rvc.wav",
-            )
-            print(
-                json.dumps(
-                    {
-                        "event": "infer_rvc_input_normalized",
-                        "role": "backing",
-                        "src": str(backing_source),
-                        "normalized": str(backing_rvc_input),
-                    }
-                )
-            )
+            backing_rvc_input = normalize_audio_to_wav(src_path=backing_source, out_path=work / "backing_for_rvc.wav")
             print(json.dumps({"event": "infer_convert_backing_start", "input": str(backing_rvc_input)}))
-            backing_infer_started = time.time()
-            backing_output = work / "backing_converted.wav"
             backing_for_mix = run_rvc_infer_file(
                 input_audio=backing_rvc_input,
-                output_wav=backing_output,
+                output_wav=work / "backing_converted.wav",
                 model_files=model_files,
                 pitch=pitch,
                 index_rate=index_rate,
@@ -2274,93 +2060,30 @@ def handle_infer_job(job, inp, bucket: str, client, effective_precision: str):
                 export_format=export_format,
                 embedder_model=embedder_model,
             )
-            backing_infer_duration_sec = max(0.0, time.time() - backing_infer_started)
-            print(
-                json.dumps(
-                    {
-                        "event": "infer_convert_backing_done",
-                        "output": str(backing_for_mix),
-                        "durationSec": round(backing_infer_duration_sec, 3),
-                    }
-                )
-            )
+            print(json.dumps({"event": "infer_convert_backing_done", "output": str(backing_for_mix)}))
         else:
             backing_for_mix = backing_source
-            if pitch != 0:
-                print(
-                    json.dumps(
-                        {
-                            "event": "backing_pitch_shift_start",
-                            "semitones": pitch,
-                            "input": str(backing_source),
-                        }
-                    )
-                )
-                backing_shift_started = time.time()
-                backing_shifted_path = work / "backing_pitch_shifted.wav"
-                backing_for_mix = pitch_shift_audio_preserve_duration(
-                    src_path=backing_source,
-                    out_path=backing_shifted_path,
-                    semitones=pitch,
-                )
-                backing_pitch_shift_duration_sec = max(0.0, time.time() - backing_shift_started)
-                print(
-                    json.dumps(
-                        {
-                            "event": "backing_pitch_shift_done",
-                            "output": str(backing_for_mix),
-                            "durationSec": round(backing_pitch_shift_duration_sec, 3),
-                        }
-                    )
-                )
 
     instrumental_for_mix = instrumental_source
-    instrumental_pitch_shift_duration_sec = 0.0
     if mix_with_input and instrumental_pitch != 0:
-        print(
-            json.dumps(
-                {
-                    "event": "instrumental_pitch_shift_start",
-                    "semitones": instrumental_pitch,
-                    "input": str(instrumental_source),
-                }
-            )
-        )
-        shift_started = time.time()
-        shifted_inst_path = work / "instrumental_pitch_shifted.wav"
         instrumental_for_mix = pitch_shift_audio_preserve_duration(
             src_path=instrumental_source,
-            out_path=shifted_inst_path,
+            out_path=work / "instrumental_pitch_shifted.wav",
             semitones=instrumental_pitch,
-        )
-        instrumental_pitch_shift_duration_sec = max(0.0, time.time() - shift_started)
-        print(
-            json.dumps(
-                {
-                    "event": "instrumental_pitch_shift_done",
-                    "output": str(instrumental_for_mix),
-                    "durationSec": round(instrumental_pitch_shift_duration_sec, 3),
-                }
-            )
         )
 
     final_path = lead_converted
-    mix_duration_sec = 0.0
     if mix_with_input:
         back_volume = 0.55 if not convert_back_vocals else 0.42
         if not add_back_vocals:
             back_volume = 0.0
-
-        mix_path = work / f"cover_mix.{export_format.lower()}"
-        mix_started = time.time()
         final_path = mix_cover_tracks(
             lead_path=lead_converted,
             inst_path=instrumental_for_mix,
             backing_path=backing_for_mix if add_back_vocals else None,
-            out_path=mix_path,
+            out_path=work / f"cover_mix.{export_format.lower()}",
             back_volume=back_volume,
         )
-        mix_duration_sec = max(0.0, time.time() - mix_started)
         print(
             json.dumps(
                 {
@@ -2368,28 +2091,14 @@ def handle_infer_job(job, inp, bucket: str, client, effective_precision: str):
                     "output": str(final_path),
                     "includeBackVocals": add_back_vocals,
                     "convertBackVocals": convert_back_vocals,
-                    "durationSec": round(mix_duration_sec, 3),
                 }
             )
         )
 
-    # Stem preview uploads are intentionally disabled to reduce storage usage.
-    # Final mixed output upload remains unchanged.
-
-    upload_duration_sec = 0.0
     try:
-        upload_started = time.time()
         print(json.dumps({"event": "infer_upload_start", "key": out_key, "bytes": final_path.stat().st_size}))
         client.upload_file(str(final_path), bucket, out_key)
-        upload_duration_sec = max(0.0, time.time() - upload_started)
-        print(
-            json.dumps(
-                {
-                    "event": "infer_upload_done",
-                    "durationSec": round(upload_duration_sec, 3),
-                }
-            )
-        )
+        print(json.dumps({"event": "infer_upload_done"}))
     except ClientError as e:
         raise RuntimeError(f"Failed to upload conversion output: s3://{bucket}/{out_key}\n{e}") from e
 
@@ -2403,50 +2112,18 @@ def handle_infer_job(job, inp, bucket: str, client, effective_precision: str):
         "outputBytes": final_path.stat().st_size,
         "pitch": pitch,
         "instrumentalPitch": instrumental_pitch,
-        "searchFeatureRatio": index_rate,
         "splitAudio": split_audio,
         "exportFormat": export_format,
         "precision": effective_precision,
         "addBackVocals": add_back_vocals,
         "convertBackVocals": convert_back_vocals,
         "mixedWithInput": mix_with_input,
-        "requireGpu": require_gpu,
-        "cache": {
-            "model": model_info.get("cache"),
-            "mainStem": main_stem_cache_status,
-            "mainStemPrefix": main_stem_cache_prefix,
-            "inputSha1": input_fingerprint,
-        },
-        "timingsSec": {
-            "total": round(total_duration_sec, 3),
-            "modelResolve": round(model_resolve_duration_sec, 3),
-            "inputDownload": round(input_download_duration_sec, 3),
-            "inputFingerprint": round(input_fingerprint_duration_sec, 3),
-            "mainStemCacheLookup": round(main_cache_lookup_duration_sec, 3),
-            "mainStem": round(main_sep_duration_sec, 3),
-            "mainStemCacheUpload": round(main_cache_upload_duration_sec, 3),
-            "backingStem": round(backing_sep_duration_sec, 3),
-            "dereverb": round(dereverb_duration_sec, 3),
-            "deecho": round(deecho_duration_sec, 3),
-            "mainInfer": round(main_infer_duration_sec, 3),
-            "backingInfer": round(backing_infer_duration_sec, 3),
-            "backingPitchShift": round(backing_pitch_shift_duration_sec, 3),
-            "instrumentalPitchShift": round(instrumental_pitch_shift_duration_sec, 3),
-            "mix": round(mix_duration_sec, 3),
-            "upload": round(upload_duration_sec, 3),
-        },
-        "stemModels": {
-            "main": main_model_used,
-            "backing": backing_model_used,
-            "dereverb": dereverb_model["name"],
-            "deecho": deecho_model["name"],
-        },
-        "stemKeys": None,
+        "deechoEnabled": deecho_enabled,
     }
 
 
 def handler(job):
-    print(json.dumps({"event": "runner_build", "build": "stemflow-20260223-karaoke-mel-default-v7"}))
+    print(json.dumps({"event": "runner_build", "build": "stemflow-20260223-vanilla-infer-reset-v8"}))
     log_runtime_dependency_info()
 
     ensure_applio()
