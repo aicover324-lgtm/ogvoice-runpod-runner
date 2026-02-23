@@ -29,13 +29,13 @@ try:
     import numpy as np  # type: ignore
 
     # Compatibility for older inference code that still references removed aliases.
-    if not hasattr(np, "int"):
+    if "int" not in np.__dict__:
         np.int = int  # type: ignore[attr-defined]
-    if not hasattr(np, "float"):
+    if "float" not in np.__dict__:
         np.float = float  # type: ignore[attr-defined]
-    if not hasattr(np, "bool"):
+    if "bool" not in np.__dict__:
         np.bool = bool  # type: ignore[attr-defined]
-    if not hasattr(np, "complex"):
+    if "complex" not in np.__dict__:
         np.complex = complex  # type: ignore[attr-defined]
 except Exception:
     np = None  # type: ignore
@@ -56,7 +56,7 @@ WORK_DIR = Path("/workspace")
 PREREQ_MARKER = APPLIO_DIR / ".prerequisites_ready"
 MUSIC_SEPARATION_DIR = Path("/app/music_separation_code")
 MUSIC_MODELS_DIR = Path("/app/music_separation_models")
-RUNNER_BUILD = "stemflow-20260223-infer-phase2-v10"
+RUNNER_BUILD = "stemflow-20260223-infer-phase2-v12"
 
 # Always use these advanced pretrained weights (32k).
 # Downloaded on demand and cached per worker at /content/Applio/pretrained_custom/*.pth
@@ -114,7 +114,7 @@ INFER_DEFAULT_INDEX_RATE = 0.75
 INFER_DEFAULT_RMS_MIX_RATE = 0.25
 INFER_DEFAULT_PROTECT = 0.33
 INFER_DEFAULT_HOP_LENGTH = 64
-INFER_DEFAULT_SPLIT_AUDIO = True
+INFER_DEFAULT_SPLIT_AUDIO = False
 INFER_DEFAULT_AUTOTUNE = False
 INFER_DEFAULT_USE_TTA = False
 INFER_DEFAULT_BATCH_SIZE = 1
@@ -830,6 +830,8 @@ def clear_model_logs(model_name: str):
 
 
 _VOICE_CONVERTER_INSTANCE = None
+_MUSIC_MODEL_DEFS_CACHE = None
+_INFER_RUNTIME_WARMED = False
 
 
 def as_dict(value):
@@ -877,8 +879,8 @@ def normalize_rvc_config(raw: dict):
             as_float(raw.get("protectVoicelessConsonants"), INFER_DEFAULT_PROTECT), 0.0, 0.5
         ),
         "hopLength": clamp_int(as_int(raw.get("hopLength"), INFER_DEFAULT_HOP_LENGTH), 1, 512),
-        # Keep split enabled in cover mode for better consistency on long inputs.
-        "splitAudio": True,
+        # Split-audio path is disabled for stability.
+        "splitAudio": False,
         "autotune": False,
         "inferBackingVocals": False,
     }
@@ -936,6 +938,21 @@ def get_voice_converter():
 
 
 def ensure_music_separation_models():
+    global _MUSIC_MODEL_DEFS_CACHE
+    if _MUSIC_MODEL_DEFS_CACHE is not None:
+        try:
+            vocals = _MUSIC_MODEL_DEFS_CACHE["vocals"]
+            karaoke = _MUSIC_MODEL_DEFS_CACHE["karaoke"]
+            if (
+                Path(vocals["config"]).exists()
+                and Path(vocals["ckpt"]).exists()
+                and Path(karaoke["config"]).exists()
+                and Path(karaoke["ckpt"]).exists()
+            ):
+                return _MUSIC_MODEL_DEFS_CACHE
+        except Exception:
+            _MUSIC_MODEL_DEFS_CACHE = None
+
     vocals_dir = MUSIC_MODELS_DIR / "vocals_mel_roformer"
     karaoke_dir = MUSIC_MODELS_DIR / "karaoke_mel_roformer"
     vocals_cfg = vocals_dir / "config.yaml"
@@ -982,7 +999,29 @@ def ensure_music_separation_models():
             }
         )
     )
+    _MUSIC_MODEL_DEFS_CACHE = models
     return models
+
+
+def warmup_infer_runtime():
+    global _INFER_RUNTIME_WARMED
+    if _INFER_RUNTIME_WARMED:
+        print(json.dumps({"event": "infer_runtime_warmup_skip", "reason": "already_warmed"}))
+        return
+
+    started = time.time()
+    ensure_cover_applio()
+    ensure_music_separation_models()
+    get_voice_converter()
+    _INFER_RUNTIME_WARMED = True
+    print(
+        json.dumps(
+            {
+                "event": "infer_runtime_warmup_done",
+                "elapsedSec": round(time.time() - started, 3),
+            }
+        )
+    )
 
 
 def run_music_separation(input_path: Path, store_dir: Path, model_type: str, config_path: Path, ckpt_path: Path, use_tta: bool):
@@ -1407,17 +1446,12 @@ def convert_with_rvc(
 ):
     output_audio_path.parent.mkdir(parents=True, exist_ok=True)
 
-    requested_split_audio = as_bool(rvc_cfg.get("splitAudio"), INFER_DEFAULT_SPLIT_AUDIO)
     attempts: list[tuple[str, Path, bool]] = [
-        ("requested", input_audio_path, requested_split_audio),
+        ("primary_split_disabled", input_audio_path, False),
     ]
-    if requested_split_audio:
-        attempts.append(("fallback_split_disabled", input_audio_path, False))
 
     wav_input = output_audio_path.parent / f"{input_audio_path.stem}_for_rvc.wav"
     attempts.append(("fallback_wav_input", wav_input, False))
-    if requested_split_audio:
-        attempts.append(("fallback_wav_input_with_split", wav_input, True))
 
     failures = []
     for idx, (attempt, attempt_input_path, split_audio) in enumerate(attempts, start=1):
@@ -1477,7 +1511,7 @@ def convert_with_rvc(
                     index_rate=as_float(rvc_cfg.get("searchFeatureRatio"), INFER_DEFAULT_INDEX_RATE),
                     volume_envelope=as_float(rvc_cfg.get("volumeEnvelope"), INFER_DEFAULT_RMS_MIX_RATE),
                     protect=as_float(rvc_cfg.get("protectVoicelessConsonants"), INFER_DEFAULT_PROTECT),
-                    split_audio=bool(split_audio),
+                    split_audio=False,
                     f0_autotune=as_bool(rvc_cfg.get("autotune"), INFER_DEFAULT_AUTOTUNE),
                     hop_length=as_int(rvc_cfg.get("hopLength"), INFER_DEFAULT_HOP_LENGTH),
                     export_format=INFER_DEFAULT_EXPORT_FORMAT,
@@ -1653,6 +1687,7 @@ def handle_infer_job(job: dict, inp: dict, client, bucket: str):
 
     infer_precision = os.environ.get("APPLIO_INFER_PRECISION", "fp16").strip().lower()
     force_cover_applio_precision(infer_precision)
+    warmup_infer_runtime()
 
     gpu = get_gpu_diagnostics()
     print(json.dumps({"event": "infer_gpu_diagnostics", **gpu}))

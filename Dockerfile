@@ -32,6 +32,106 @@ RUN git clone https://github.com/Eddycrack864/RVC-AI-Cover-Maker-UI --depth 1 /t
   && test -f /app/music_separation_code/inference.py \
   && rm -rf /tmp/rvc_cover
 
+# Deterministic preload of fixed inference assets so workers don't download
+# large model files during requests.
+RUN python - <<'PY'
+from pathlib import Path
+from urllib.request import Request, urlopen
+import time
+
+assets = [
+    # Mel-Roformer vocals
+    (
+        "https://raw.githubusercontent.com/ZFTurbo/Music-Source-Separation-Training/main/configs/KimberleyJensen/config_vocals_mel_band_roformer_kj.yaml",
+        "/app/music_separation_models/vocals_mel_roformer/config.yaml",
+        200,
+    ),
+    (
+        "https://huggingface.co/KimberleyJSN/melbandroformer/resolve/main/MelBandRoformer.ckpt",
+        "/app/music_separation_models/vocals_mel_roformer/model.ckpt",
+        5_000_000,
+    ),
+    # Mel-Roformer karaoke
+    (
+        "https://huggingface.co/shiromiya/audio-separation-models/resolve/main/mel_band_roformer_karaoke_aufr33_viperx/config_mel_band_roformer_karaoke.yaml",
+        "/app/music_separation_models/karaoke_mel_roformer/config.yaml",
+        200,
+    ),
+    (
+        "https://huggingface.co/shiromiya/audio-separation-models/resolve/main/mel_band_roformer_karaoke_aufr33_viperx/mel_band_roformer_karaoke_aufr33_viperx_sdr_10.1956.ckpt",
+        "/app/music_separation_models/karaoke_mel_roformer/model.ckpt",
+        5_000_000,
+    ),
+    # UVR de-reverb / de-echo models
+    (
+        "https://huggingface.co/shiromiya/audio-separation-models/resolve/main/UVR-DeEcho-DeReverb.pth",
+        "/app/music_separation_models/uvr/UVR-DeEcho-DeReverb.pth",
+        5_000_000,
+    ),
+    (
+        "https://huggingface.co/shiromiya/audio-separation-models/resolve/main/UVR-De-Echo-Normal.pth",
+        "/app/music_separation_models/uvr/UVR-De-Echo-Normal.pth",
+        5_000_000,
+    ),
+    # Cover Applio predictors and embedder
+    (
+        "https://huggingface.co/IAHispano/Applio/resolve/main/Resources/predictors/rmvpe.pt",
+        "/app/programs/applio_code/rvc/models/predictors/rmvpe.pt",
+        1_000_000,
+    ),
+    (
+        "https://huggingface.co/IAHispano/Applio/resolve/main/Resources/predictors/fcpe.pt",
+        "/app/programs/applio_code/rvc/models/predictors/fcpe.pt",
+        1_000_000,
+    ),
+    (
+        "https://huggingface.co/IAHispano/Applio/resolve/main/Resources/embedders/contentvec/pytorch_model.bin",
+        "/app/programs/applio_code/rvc/models/embedders/contentvec/pytorch_model.bin",
+        1_000_000,
+    ),
+    (
+        "https://huggingface.co/IAHispano/Applio/resolve/main/Resources/embedders/contentvec/config.json",
+        "/app/programs/applio_code/rvc/models/embedders/contentvec/config.json",
+        200,
+    ),
+]
+
+def download(url: str, dest: Path, min_bytes: int):
+    if dest.exists() and dest.stat().st_size >= min_bytes:
+        print("cached", dest)
+        return
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dest.with_suffix(dest.suffix + ".tmp")
+    if tmp.exists():
+        tmp.unlink()
+    last = None
+    for i in range(3):
+        try:
+            req = Request(url, headers={"User-Agent": "ogvoice-runpod-runner/1.0"})
+            with urlopen(req, timeout=180) as r, open(tmp, "wb") as f:
+                while True:
+                    chunk = r.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+            if not tmp.exists() or tmp.stat().st_size < min_bytes:
+                raise RuntimeError(f"downloaded file too small for {dest}")
+            if dest.exists():
+                dest.unlink()
+            tmp.replace(dest)
+            print("downloaded", dest)
+            return
+        except Exception as e:
+            last = e
+            if tmp.exists():
+                tmp.unlink()
+            time.sleep(2 * (i + 1))
+    raise RuntimeError(f"failed to download {url}: {last}")
+
+for url, path, min_bytes in assets:
+    download(url, Path(path), min_bytes)
+PY
+
 # Compatibility patch for BS-Roformer karaoke config variants.
 # Some checkpoints/configs include `mlp_expansion_factor` for BSRoformer; older
 # upstream code does not expose this argument and crashes at runtime.
