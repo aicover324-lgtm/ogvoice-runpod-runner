@@ -6,6 +6,7 @@ import zipfile
 import time
 import re
 import sys
+import logging
 from collections import deque
 from pathlib import Path
 from urllib.request import Request, urlopen
@@ -22,6 +23,14 @@ try:
 except Exception:
     torch = None  # type: ignore
     _TORCH_AVAILABLE = False
+
+try:
+    from audio_separator.separator import Separator  # type: ignore
+
+    _AUDIO_SEPARATOR_AVAILABLE = True
+except Exception:
+    Separator = None  # type: ignore
+    _AUDIO_SEPARATOR_AVAILABLE = False
 
 
 APPLIO_DIR = Path("/content/Applio")
@@ -86,7 +95,7 @@ INFER_DEFAULT_INDEX_RATE = 0.75
 INFER_DEFAULT_RMS_MIX_RATE = 0.25
 INFER_DEFAULT_PROTECT = 0.33
 INFER_DEFAULT_HOP_LENGTH = 64
-INFER_DEFAULT_SPLIT_AUDIO = False
+INFER_DEFAULT_SPLIT_AUDIO = True
 INFER_DEFAULT_AUTOTUNE = False
 INFER_DEFAULT_USE_TTA = False
 INFER_DEFAULT_BATCH_SIZE = 1
@@ -107,6 +116,21 @@ KARAOKE_MODEL_CKPT_URL = os.environ.get(
     "KARAOKE_MODEL_CKPT_URL",
     "https://huggingface.co/shiromiya/audio-separation-models/resolve/main/mel_band_roformer_karaoke_aufr33_viperx/mel_band_roformer_karaoke_aufr33_viperx_sdr_10.1956.ckpt",
 )
+
+UVR_MODEL_FILE_DEREVERB = os.environ.get(
+    "UVR_MODEL_FILE_DEREVERB",
+    "UVR-DeEcho-DeReverb.pth",
+)
+UVR_MODEL_FILE_DEECHO = os.environ.get(
+    "UVR_MODEL_FILE_DEECHO",
+    "UVR-De-Echo-Normal.pth",
+)
+UVR_MODELS_DIR = MUSIC_MODELS_DIR / "uvr"
+
+INFER_FIXED_VOCALS_MODEL = "Mel-Roformer"
+INFER_FIXED_KARAOKE_MODEL = "Mel-Roformer Karaoke"
+INFER_FIXED_DEREVERB_MODEL = "UVR-Deecho-Dereverb"
+INFER_FIXED_DEECHO_MODEL = "UVR-Deecho-Normal"
 
 ALLOWED_EXPORT_FORMATS = {"WAV", "MP3", "FLAC", "OGG", "M4A"}
 ALLOWED_PITCH_EXTRACTORS = {"rmvpe", "crepe", "crepe-tiny", "fcpe"}
@@ -663,8 +687,9 @@ def normalize_rvc_config(raw: dict):
             as_float(raw.get("protectVoicelessConsonants"), INFER_DEFAULT_PROTECT), 0.0, 0.5
         ),
         "hopLength": clamp_int(as_int(raw.get("hopLength"), INFER_DEFAULT_HOP_LENGTH), 1, 512),
-        "splitAudio": as_bool(raw.get("splitAudio"), INFER_DEFAULT_SPLIT_AUDIO),
-        "autotune": as_bool(raw.get("autotune"), INFER_DEFAULT_AUTOTUNE),
+        # Keep split enabled in cover mode for better consistency on long inputs.
+        "splitAudio": True,
+        "autotune": False,
         "inferBackingVocals": as_bool(raw.get("inferBackingVocals"), False),
     }
 
@@ -675,16 +700,25 @@ def normalize_audio_separation_config(raw: dict):
     return {
         "addBackVocals": as_bool(raw.get("addBackVocals"), False),
         "backVocalMode": back_mode,
-        "useTta": as_bool(raw.get("useTta"), INFER_DEFAULT_USE_TTA),
-        "batchSize": clamp_int(as_int(raw.get("batchSize"), INFER_DEFAULT_BATCH_SIZE), 1, 24),
+        "useTta": False,
+        "batchSize": 1,
+        "vocalsModel": INFER_FIXED_VOCALS_MODEL,
+        "karaokeModel": INFER_FIXED_KARAOKE_MODEL,
+        "dereverbModel": INFER_FIXED_DEREVERB_MODEL,
+        "deechoEnabled": True,
+        "deechoModel": INFER_FIXED_DEECHO_MODEL,
+        "denoiseEnabled": False,
     }
 
 
 def normalize_post_process_config(raw: dict):
     return {
-        "exportFormat": normalize_export_format(raw.get("exportFormat")),
+        "exportFormat": "WAV",
         "deleteIntermediateAudios": as_bool(raw.get("deleteIntermediateAudios"), True),
-        "reverb": as_bool(raw.get("reverb"), False),
+        "reverb": False,
+        "instrumentalPitch": clamp_int(as_int(raw.get("instrumentalPitch"), 0), -24, 24),
+        "instrumentalPitchFollowsMainPitch": True,
+        "mixGainEnabled": False,
     }
 
 
@@ -766,12 +800,129 @@ def run_music_separation(input_path: Path, store_dir: Path, model_type: str, con
     run(cmd, cwd=str(WORK_DIR))
 
 
+def run_uvr_single_stem(
+    input_path: Path,
+    store_dir: Path,
+    model_filename: str,
+    output_single_stem: str,
+    use_tta: bool,
+    batch_size: int,
+):
+    if not _AUDIO_SEPARATOR_AVAILABLE or Separator is None:
+        raise RuntimeError("audio-separator is not available in this worker image.")
+
+    if store_dir.exists():
+        shutil.rmtree(store_dir, ignore_errors=True)
+    store_dir.mkdir(parents=True, exist_ok=True)
+    UVR_MODELS_DIR.mkdir(parents=True, exist_ok=True)
+
+    separator = Separator(
+        model_file_dir=str(UVR_MODELS_DIR),
+        log_level=logging.WARNING,
+        normalization_threshold=1.0,
+        output_format="flac",
+        output_dir=str(store_dir),
+        output_single_stem=output_single_stem,
+        vr_params={
+            "batch_size": int(max(1, min(24, batch_size))),
+            "enable_tta": bool(use_tta),
+        },
+    )
+    separator.load_model(model_filename=model_filename)
+    separator.separate(str(input_path))
+
+    result = find_latest_stem_file(store_dir)
+    if not result:
+        raise RuntimeError(
+            f"UVR stage failed for model={model_filename} stem={output_single_stem}."
+        )
+    return result
+
+
 def find_stem_file(store_dir: Path, contains: str):
     files = sorted(store_dir.glob("*.flac"), key=lambda p: p.stat().st_mtime, reverse=True)
     for f in files:
         if contains.lower() in f.name.lower():
             return f
     return None
+
+
+def find_latest_stem_file(store_dir: Path):
+    files = sorted(store_dir.glob("*.flac"), key=lambda p: p.stat().st_mtime, reverse=True)
+    return files[0] if files else None
+
+
+def get_audio_sample_rate(path: Path):
+    try:
+        out = run(
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-select_streams",
+                "a:0",
+                "-show_entries",
+                "stream=sample_rate",
+                "-of",
+                "default=noprint_wrappers=1:nokey=1",
+                str(path),
+            ]
+        )
+        value = int(str(out).strip().splitlines()[0])
+        if value > 0:
+            return value
+    except Exception:
+        pass
+    return 44100
+
+
+def build_atempo_filters(target_ratio: float):
+    ratio = float(target_ratio)
+    if ratio <= 0:
+        return "atempo=1.0"
+
+    factors = []
+    while ratio < 0.5:
+        factors.append(0.5)
+        ratio /= 0.5
+    while ratio > 2.0:
+        factors.append(2.0)
+        ratio /= 2.0
+    factors.append(ratio)
+    return ",".join([f"atempo={f:.8f}" for f in factors])
+
+
+def shift_audio_pitch_to_semitones(
+    input_path: Path,
+    output_path: Path,
+    semitones: int,
+):
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    shift = int(semitones)
+    if shift == 0:
+        shutil.copyfile(input_path, output_path)
+        return
+
+    factor = 2 ** (float(shift) / 12.0)
+    sample_rate = get_audio_sample_rate(input_path)
+    tempo_ratio = 1.0 / factor
+    atempo_chain = build_atempo_filters(tempo_ratio)
+    filter_chain = f"asetrate={int(round(sample_rate * factor))},aresample={sample_rate},{atempo_chain}"
+
+    run(
+        [
+            "ffmpeg",
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-i",
+            str(input_path),
+            "-filter:a",
+            filter_chain,
+            str(output_path),
+        ]
+    )
 
 
 def extract_model_artifact(model_zip_path: Path, extract_dir: Path):
@@ -951,6 +1102,8 @@ def handle_infer_job(job: dict, inp: dict, client, bucket: str):
         or as_bool(rvc_cfg.get("inferBackingVocals"), False)
     ) and add_back_vocals
     use_tta = as_bool(sep_cfg.get("useTta"), INFER_DEFAULT_USE_TTA)
+    batch_size = clamp_int(as_int(sep_cfg.get("batchSize"), INFER_DEFAULT_BATCH_SIZE), 1, 24)
+    instrumental_pitch = clamp_int(as_int(rvc_cfg.get("pitch"), 0), -24, 24)
 
     infer_precision = os.environ.get("APPLIO_INFER_PRECISION", "fp16").strip().lower()
     force_applio_precision(infer_precision)
@@ -962,6 +1115,12 @@ def handle_infer_job(job: dict, inp: dict, client, bucket: str):
             {
                 "event": "infer_config_normalized",
                 "config": config,
+                "fixedModels": {
+                    "vocalsModel": INFER_FIXED_VOCALS_MODEL,
+                    "karaokeModel": INFER_FIXED_KARAOKE_MODEL,
+                    "dereverbModel": INFER_FIXED_DEREVERB_MODEL,
+                    "deechoModel": INFER_FIXED_DEECHO_MODEL,
+                },
             }
         )
     )
@@ -979,6 +1138,8 @@ def handle_infer_job(job: dict, inp: dict, client, bucket: str):
     model_extract_dir = work_dir / "model_artifact"
     stems_vocals_dir = work_dir / "stems_vocals"
     stems_karaoke_dir = work_dir / "stems_karaoke"
+    stems_dereverb_dir = work_dir / "stems_dereverb"
+    stems_deecho_dir = work_dir / "stems_deecho"
     output_dir = work_dir / "output"
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1028,10 +1189,32 @@ def handle_infer_job(job: dict, inp: dict, client, bucket: str):
         else:
             print(json.dumps({"event": "infer_separation_backing_done", "backingStem": backing_stem.name}))
 
+    print(json.dumps({"event": "infer_dereverb_start", "model": INFER_FIXED_DEREVERB_MODEL}))
+    dereverb_stem = run_uvr_single_stem(
+        input_path=vocals_stem,
+        store_dir=stems_dereverb_dir,
+        model_filename=UVR_MODEL_FILE_DEREVERB,
+        output_single_stem="No Reverb",
+        use_tta=use_tta,
+        batch_size=batch_size,
+    )
+    print(json.dumps({"event": "infer_dereverb_done", "output": dereverb_stem.name}))
+
+    print(json.dumps({"event": "infer_deecho_start", "model": INFER_FIXED_DEECHO_MODEL}))
+    deecho_stem = run_uvr_single_stem(
+        input_path=dereverb_stem,
+        store_dir=stems_deecho_dir,
+        model_filename=UVR_MODEL_FILE_DEECHO,
+        output_single_stem="No Echo",
+        use_tta=use_tta,
+        batch_size=batch_size,
+    )
+    print(json.dumps({"event": "infer_deecho_done", "output": deecho_stem.name}))
+
     converted_main_vocals = output_dir / "main_vocals_converted.wav"
     print(json.dumps({"event": "infer_rvc_main_start"}))
     convert_with_rvc(
-        input_audio_path=vocals_stem,
+        input_audio_path=deecho_stem,
         output_audio_path=converted_main_vocals,
         model_path=model_path,
         index_path=index_path,
@@ -1053,11 +1236,37 @@ def handle_infer_job(job: dict, inp: dict, client, bucket: str):
         final_backing_stem = converted_backing
         print(json.dumps({"event": "infer_rvc_backing_done", "output": converted_backing.name}))
 
+    instrumental_for_mix = instrumental_stem
+    if instrumental_pitch != 0:
+        shifted_instrumental = output_dir / "instrumental_pitch_shifted.flac"
+        print(
+            json.dumps(
+                {
+                    "event": "infer_instrumental_pitch_shift_start",
+                    "semitones": instrumental_pitch,
+                }
+            )
+        )
+        shift_audio_pitch_to_semitones(
+            input_path=instrumental_stem,
+            output_path=shifted_instrumental,
+            semitones=instrumental_pitch,
+        )
+        instrumental_for_mix = shifted_instrumental
+        print(
+            json.dumps(
+                {
+                    "event": "infer_instrumental_pitch_shift_done",
+                    "output": shifted_instrumental.name,
+                }
+            )
+        )
+
     final_mix_path = output_dir / "cover_final.wav"
     print(json.dumps({"event": "infer_mix_start"}))
     mix_tracks(
         main_vocal_path=converted_main_vocals,
-        instrumental_path=instrumental_stem,
+        instrumental_path=instrumental_for_mix,
         output_path=final_mix_path,
         backing_vocal_path=final_backing_stem if add_back_vocals else None,
     )
@@ -1077,7 +1286,7 @@ def handle_infer_job(job: dict, inp: dict, client, bucket: str):
     print(json.dumps({"event": "infer_upload_start", "outKey": out_key}))
     client.upload_file(str(final_upload_path), bucket, out_key)
     upload_if_present(client, bucket, converted_main_vocals, stem_keys.get("mainVocalsKey"))
-    upload_if_present(client, bucket, instrumental_stem, stem_keys.get("instrumentalKey"))
+    upload_if_present(client, bucket, instrumental_for_mix, stem_keys.get("instrumentalKey"))
     upload_if_present(client, bucket, final_backing_stem if add_back_vocals else None, stem_keys.get("backVocalsKey"))
     print(json.dumps({"event": "infer_upload_done"}))
     output_bytes = final_upload_path.stat().st_size if final_upload_path.exists() else None
@@ -1106,7 +1315,7 @@ def handle_infer_job(job: dict, inp: dict, client, bucket: str):
 
 
 def handler(job):
-    print(json.dumps({"event": "runner_build", "build": "stemflow-20260223-infer-phase1-v1"}))
+    print(json.dumps({"event": "runner_build", "build": "stemflow-20260223-infer-phase2-v1"}))
     log_runtime_dependency_info()
 
     ensure_applio()
