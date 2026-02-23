@@ -108,6 +108,15 @@ KARAOKE_MODEL_CKPT_URL = os.environ.get(
     "https://huggingface.co/shiromiya/audio-separation-models/resolve/main/mel_band_roformer_karaoke_aufr33_viperx/mel_band_roformer_karaoke_aufr33_viperx_sdr_10.1956.ckpt",
 )
 
+ALLOWED_EXPORT_FORMATS = {"WAV", "MP3", "FLAC", "OGG", "M4A"}
+ALLOWED_PITCH_EXTRACTORS = {"rmvpe", "crepe", "crepe-tiny", "fcpe"}
+ALLOWED_EMBEDDERS = {
+    "contentvec",
+    "chinese-hubert-base",
+    "japanese-hubert-base",
+    "korean-hubert-base",
+}
+
 
 def require_env(name: str) -> str:
     v = os.environ.get(name)
@@ -613,6 +622,81 @@ def as_dict(value):
     return value if isinstance(value, dict) else {}
 
 
+def clamp_int(value: int, min_value: int, max_value: int):
+    return max(min_value, min(max_value, int(value)))
+
+
+def clamp_float(value: float, min_value: float, max_value: float):
+    return max(min_value, min(max_value, float(value)))
+
+
+def normalize_export_format(value):
+    if not isinstance(value, str):
+        return "WAV"
+    fmt = value.strip().upper()
+    return fmt if fmt in ALLOWED_EXPORT_FORMATS else "WAV"
+
+
+def normalize_pitch_extractor(value):
+    if not isinstance(value, str):
+        return INFER_DEFAULT_PITCH_EXTRACTOR
+    extractor = value.strip().lower()
+    return extractor if extractor in ALLOWED_PITCH_EXTRACTORS else INFER_DEFAULT_PITCH_EXTRACTOR
+
+
+def normalize_embedder_model(value):
+    if not isinstance(value, str):
+        return INFER_DEFAULT_EMBEDDER
+    embedder = value.strip()
+    return embedder if embedder in ALLOWED_EMBEDDERS else INFER_DEFAULT_EMBEDDER
+
+
+def normalize_rvc_config(raw: dict):
+    return {
+        "pitch": clamp_int(as_int(raw.get("pitch"), 0), -24, 24),
+        "pitchExtractor": normalize_pitch_extractor(raw.get("pitchExtractor")),
+        "embedderModel": normalize_embedder_model(raw.get("embedderModel")),
+        "filterRadius": clamp_int(as_int(raw.get("filterRadius"), INFER_DEFAULT_FILTER_RADIUS), 0, 7),
+        "searchFeatureRatio": clamp_float(as_float(raw.get("searchFeatureRatio"), INFER_DEFAULT_INDEX_RATE), 0.0, 1.0),
+        "volumeEnvelope": clamp_float(as_float(raw.get("volumeEnvelope"), INFER_DEFAULT_RMS_MIX_RATE), 0.0, 1.0),
+        "protectVoicelessConsonants": clamp_float(
+            as_float(raw.get("protectVoicelessConsonants"), INFER_DEFAULT_PROTECT), 0.0, 0.5
+        ),
+        "hopLength": clamp_int(as_int(raw.get("hopLength"), INFER_DEFAULT_HOP_LENGTH), 1, 512),
+        "splitAudio": as_bool(raw.get("splitAudio"), INFER_DEFAULT_SPLIT_AUDIO),
+        "autotune": as_bool(raw.get("autotune"), INFER_DEFAULT_AUTOTUNE),
+        "inferBackingVocals": as_bool(raw.get("inferBackingVocals"), False),
+    }
+
+
+def normalize_audio_separation_config(raw: dict):
+    back_mode_raw = str(raw.get("backVocalMode") or "").strip().lower()
+    back_mode = "convert" if back_mode_raw == "convert" else "do_not_convert"
+    return {
+        "addBackVocals": as_bool(raw.get("addBackVocals"), False),
+        "backVocalMode": back_mode,
+        "useTta": as_bool(raw.get("useTta"), INFER_DEFAULT_USE_TTA),
+        "batchSize": clamp_int(as_int(raw.get("batchSize"), INFER_DEFAULT_BATCH_SIZE), 1, 24),
+    }
+
+
+def normalize_post_process_config(raw: dict):
+    return {
+        "exportFormat": normalize_export_format(raw.get("exportFormat")),
+        "deleteIntermediateAudios": as_bool(raw.get("deleteIntermediateAudios"), True),
+        "reverb": as_bool(raw.get("reverb"), False),
+    }
+
+
+def normalize_infer_config(raw_config: dict):
+    config = as_dict(raw_config)
+    return {
+        "rvc": normalize_rvc_config(as_dict(config.get("rvc"))),
+        "audioSeparation": normalize_audio_separation_config(as_dict(config.get("audioSeparation"))),
+        "postProcess": normalize_post_process_config(as_dict(config.get("postProcess"))),
+    }
+
+
 def get_voice_converter():
     global _VOICE_CONVERTER_INSTANCE
     if _VOICE_CONVERTER_INSTANCE is not None:
@@ -781,6 +865,52 @@ def mix_tracks(main_vocal_path: Path, instrumental_path: Path, output_path: Path
     run(cmd)
 
 
+def export_audio_format(src_wav_path: Path, output_path: Path, export_format: str):
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    fmt = normalize_export_format(export_format)
+    if fmt == "WAV":
+        shutil.copyfile(src_wav_path, output_path)
+        return
+
+    codec_args = []
+    if fmt == "MP3":
+        codec_args = ["-codec:a", "libmp3lame", "-b:a", "320k"]
+    elif fmt == "FLAC":
+        codec_args = ["-codec:a", "flac"]
+    elif fmt == "OGG":
+        codec_args = ["-codec:a", "libvorbis", "-q:a", "6"]
+    elif fmt == "M4A":
+        codec_args = ["-codec:a", "aac", "-b:a", "256k"]
+
+    run(
+        [
+            "ffmpeg",
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-i",
+            str(src_wav_path),
+            *codec_args,
+            str(output_path),
+        ]
+    )
+
+
+def normalize_stem_keys(raw: dict):
+    def clean(value):
+        if not isinstance(value, str):
+            return None
+        v = value.strip()
+        return v if v else None
+
+    return {
+        "mainVocalsKey": clean(raw.get("mainVocalsKey")),
+        "backVocalsKey": clean(raw.get("backVocalsKey")),
+        "instrumentalKey": clean(raw.get("instrumentalKey")),
+    }
+
+
 def upload_if_present(client, bucket: str, local_path: Path | None, key: str | None):
     if not local_path or not key:
         return
@@ -797,13 +927,23 @@ def handle_infer_job(job: dict, inp: dict, client, bucket: str):
     if "outKey" not in inp:
         raise RuntimeError("Missing required input: outKey")
 
-    input_audio_key = str(inp.get("inputAudioKey") or inp.get("inputStorageKey"))
-    model_artifact_key = str(inp.get("modelArtifactKey"))
-    out_key = str(inp.get("outKey"))
-    config = as_dict(inp.get("config"))
-    rvc_cfg = as_dict(config.get("rvc"))
-    sep_cfg = as_dict(config.get("audioSeparation"))
-    stem_keys = as_dict(inp.get("stemKeys"))
+    input_audio_key = str(inp.get("inputAudioKey") or inp.get("inputStorageKey") or "").strip()
+    model_artifact_key = str(inp.get("modelArtifactKey") or "").strip()
+    out_key = str(inp.get("outKey") or "").strip()
+    if not input_audio_key:
+        raise RuntimeError("inputAudioKey is empty.")
+    if not model_artifact_key:
+        raise RuntimeError("modelArtifactKey is empty.")
+    if not model_artifact_key.lower().endswith(".zip"):
+        raise RuntimeError("modelArtifactKey must point to a .zip artifact.")
+    if not out_key:
+        raise RuntimeError("outKey is empty.")
+
+    config = normalize_infer_config(as_dict(inp.get("config")))
+    rvc_cfg = config["rvc"]
+    sep_cfg = config["audioSeparation"]
+    post_cfg = config["postProcess"]
+    stem_keys = normalize_stem_keys(as_dict(inp.get("stemKeys")))
 
     add_back_vocals = as_bool(sep_cfg.get("addBackVocals"), False)
     convert_back_vocals = (
@@ -817,6 +957,14 @@ def handle_infer_job(job: dict, inp: dict, client, bucket: str):
 
     gpu = get_gpu_diagnostics()
     print(json.dumps({"event": "infer_gpu_diagnostics", **gpu}))
+    print(
+        json.dumps(
+            {
+                "event": "infer_config_normalized",
+                "config": config,
+            }
+        )
+    )
 
     model_defs = ensure_music_separation_models()
 
@@ -915,18 +1063,37 @@ def handle_infer_job(job: dict, inp: dict, client, bucket: str):
     )
     print(json.dumps({"event": "infer_mix_done", "output": final_mix_path.name, "bytes": final_mix_path.stat().st_size}))
 
+    final_export_ext = post_cfg["exportFormat"].lower()
+    final_upload_path = output_dir / f"cover_final.{final_export_ext}"
+    if post_cfg["exportFormat"] == "WAV":
+        final_upload_path = final_mix_path
+    else:
+        export_audio_format(
+            src_wav_path=final_mix_path,
+            output_path=final_upload_path,
+            export_format=post_cfg["exportFormat"],
+        )
+
     print(json.dumps({"event": "infer_upload_start", "outKey": out_key}))
-    client.upload_file(str(final_mix_path), bucket, out_key)
+    client.upload_file(str(final_upload_path), bucket, out_key)
     upload_if_present(client, bucket, converted_main_vocals, stem_keys.get("mainVocalsKey"))
     upload_if_present(client, bucket, instrumental_stem, stem_keys.get("instrumentalKey"))
     upload_if_present(client, bucket, final_backing_stem if add_back_vocals else None, stem_keys.get("backVocalsKey"))
     print(json.dumps({"event": "infer_upload_done"}))
+    output_bytes = final_upload_path.stat().st_size if final_upload_path.exists() else None
+
+    if post_cfg["deleteIntermediateAudios"]:
+        try:
+            shutil.rmtree(work_dir, ignore_errors=True)
+            print(json.dumps({"event": "infer_cleanup_done", "workDir": str(work_dir)}))
+        except Exception as cleanup_error:
+            print(json.dumps({"event": "infer_cleanup_failed", "error": str(cleanup_error)[:500]}))
 
     return {
         "ok": True,
         "mode": "infer",
         "outputKey": out_key,
-        "outputBytes": final_mix_path.stat().st_size if final_mix_path.exists() else None,
+        "outputBytes": output_bytes,
         "stemKeys": {
             "mainVocalsKey": stem_keys.get("mainVocalsKey"),
             "backVocalsKey": stem_keys.get("backVocalsKey") if add_back_vocals else None,
@@ -934,6 +1101,7 @@ def handle_infer_job(job: dict, inp: dict, client, bucket: str):
         },
         "modelArtifactKey": model_artifact_key,
         "inputAudioKey": input_audio_key,
+        "effectiveConfig": config,
     }
 
 
