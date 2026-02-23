@@ -118,6 +118,18 @@ MUSIC_SEPARATION_INFER = MUSIC_SEPARATION_DIR / "inference.py"
 MUSIC_SEPARATION_MODELS_DIR = Path(
     os.environ.get("MUSIC_SEPARATION_MODELS_DIR", "/app/music_separation_models")
 )
+APPLIO_PREDICTORS_DIR = APPLIO_DIR / "rvc" / "models" / "predictors"
+APPLIO_RMVPE_PATH = APPLIO_PREDICTORS_DIR / "rmvpe.pt"
+APPLIO_FCPE_PATH = APPLIO_PREDICTORS_DIR / "fcpe.pt"
+
+APPLIO_RMVPE_URL = os.environ.get(
+    "APPLIO_RMVPE_URL",
+    "https://huggingface.co/IAHispano/Applio/resolve/main/Resources/predictors/rmvpe.pt",
+)
+APPLIO_FCPE_URL = os.environ.get(
+    "APPLIO_FCPE_URL",
+    "https://huggingface.co/IAHispano/Applio/resolve/main/Resources/predictors/fcpe.pt",
+)
 AUDIO_SEPARATOR_MODEL_DIR = Path(
     os.environ.get("AUDIO_SEPARATOR_MODEL_DIR", str(WORK_DIR / "audio_separator_models"))
 )
@@ -528,6 +540,25 @@ def ensure_applio():
     core = APPLIO_DIR / "core.py"
     if not core.exists():
         raise RuntimeError(f"Applio core.py not found: {core}")
+
+
+def ensure_applio_predictor_files(f0_method: str):
+    method = normalized_model_name(f0_method)
+    APPLIO_PREDICTORS_DIR.mkdir(parents=True, exist_ok=True)
+
+    if method == "rmvpe":
+        if (not APPLIO_RMVPE_PATH.exists()) or APPLIO_RMVPE_PATH.stat().st_size < 5_000_000:
+            print(json.dumps({"event": "applio_predictor_download_start", "method": "rmvpe", "url": APPLIO_RMVPE_URL}))
+            download_file_http(APPLIO_RMVPE_URL, APPLIO_RMVPE_PATH, min_bytes=5_000_000)
+            print(json.dumps({"event": "applio_predictor_download_done", "method": "rmvpe", "bytes": APPLIO_RMVPE_PATH.stat().st_size}))
+        return
+
+    if method == "fcpe":
+        if (not APPLIO_FCPE_PATH.exists()) or APPLIO_FCPE_PATH.stat().st_size < 1_000_000:
+            print(json.dumps({"event": "applio_predictor_download_start", "method": "fcpe", "url": APPLIO_FCPE_URL}))
+            download_file_http(APPLIO_FCPE_URL, APPLIO_FCPE_PATH, min_bytes=1_000_000)
+            print(json.dumps({"event": "applio_predictor_download_done", "method": "fcpe", "bytes": APPLIO_FCPE_PATH.stat().st_size}))
+        return
 
 
 def download_file_http(
@@ -1611,6 +1642,8 @@ def run_rvc_infer_file(
     export_format: str,
     embedder_model: str,
 ):
+    ensure_applio_predictor_files(f0_method)
+
     def build_infer_cmd(split_flag: bool):
         return [
             "python",
@@ -2123,7 +2156,7 @@ def handle_infer_job(job, inp, bucket: str, client, effective_precision: str):
 
 
 def handler(job):
-    print(json.dumps({"event": "runner_build", "build": "stemflow-20260223-vanilla-infer-reset-v8"}))
+    print(json.dumps({"event": "runner_build", "build": "stemflow-20260223-vanilla-infer-reset-v9"}))
     log_runtime_dependency_info()
 
     ensure_applio()
