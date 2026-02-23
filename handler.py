@@ -41,7 +41,7 @@ WORK_DIR = Path("/workspace")
 PREREQ_MARKER = APPLIO_DIR / ".prerequisites_ready"
 MUSIC_SEPARATION_DIR = Path("/app/music_separation_code")
 MUSIC_MODELS_DIR = Path("/app/music_separation_models")
-RUNNER_BUILD = "stemflow-20260223-infer-phase2-v6"
+RUNNER_BUILD = "stemflow-20260223-infer-phase2-v8"
 
 # Always use these advanced pretrained weights (32k).
 # Downloaded on demand and cached per worker at /content/Applio/pretrained_custom/*.pth
@@ -104,31 +104,14 @@ INFER_DEFAULT_AUTOTUNE = False
 INFER_DEFAULT_USE_TTA = False
 INFER_DEFAULT_BATCH_SIZE = 1
 
-VOCALS_MODEL_CONFIG_URL = os.environ.get(
-    "VOCALS_MODEL_CONFIG_URL",
-    "https://raw.githubusercontent.com/ZFTurbo/Music-Source-Separation-Training/main/configs/KimberleyJensen/config_vocals_mel_band_roformer_kj.yaml",
-)
-VOCALS_MODEL_CKPT_URL = os.environ.get(
-    "VOCALS_MODEL_CKPT_URL",
-    "https://huggingface.co/KimberleyJSN/melbandroformer/resolve/main/MelBandRoformer.ckpt",
-)
-KARAOKE_MODEL_CONFIG_URL = os.environ.get(
-    "KARAOKE_MODEL_CONFIG_URL",
-    "https://huggingface.co/shiromiya/audio-separation-models/resolve/main/mel_band_roformer_karaoke_aufr33_viperx/config_mel_band_roformer_karaoke.yaml",
-)
-KARAOKE_MODEL_CKPT_URL = os.environ.get(
-    "KARAOKE_MODEL_CKPT_URL",
-    "https://huggingface.co/shiromiya/audio-separation-models/resolve/main/mel_band_roformer_karaoke_aufr33_viperx/mel_band_roformer_karaoke_aufr33_viperx_sdr_10.1956.ckpt",
-)
+# Stem-separation model sources are locked to RVC-AI-Cover-Maker references.
+VOCALS_MODEL_CONFIG_URL = "https://raw.githubusercontent.com/ZFTurbo/Music-Source-Separation-Training/main/configs/KimberleyJensen/config_vocals_mel_band_roformer_kj.yaml"
+VOCALS_MODEL_CKPT_URL = "https://huggingface.co/KimberleyJSN/melbandroformer/resolve/main/MelBandRoformer.ckpt"
+KARAOKE_MODEL_CONFIG_URL = "https://huggingface.co/shiromiya/audio-separation-models/resolve/main/mel_band_roformer_karaoke_aufr33_viperx/config_mel_band_roformer_karaoke.yaml"
+KARAOKE_MODEL_CKPT_URL = "https://huggingface.co/shiromiya/audio-separation-models/resolve/main/mel_band_roformer_karaoke_aufr33_viperx/mel_band_roformer_karaoke_aufr33_viperx_sdr_10.1956.ckpt"
 
-UVR_MODEL_FILE_DEREVERB = os.environ.get(
-    "UVR_MODEL_FILE_DEREVERB",
-    "UVR-DeEcho-DeReverb.pth",
-)
-UVR_MODEL_FILE_DEECHO = os.environ.get(
-    "UVR_MODEL_FILE_DEECHO",
-    "UVR-De-Echo-Normal.pth",
-)
+UVR_MODEL_FILE_DEREVERB = "UVR-DeEcho-DeReverb.pth"
+UVR_MODEL_FILE_DEECHO = "UVR-De-Echo-Normal.pth"
 UVR_MODELS_DIR = MUSIC_MODELS_DIR / "uvr"
 
 INFER_FIXED_VOCALS_MODEL = "Mel-Roformer"
@@ -907,10 +890,36 @@ def ensure_music_separation_models():
     if not karaoke_ckpt.exists() or karaoke_ckpt.stat().st_size < 5_000_000:
         download_file_http(KARAOKE_MODEL_CKPT_URL, karaoke_ckpt, min_bytes=5_000_000)
 
-    return {
+    models = {
         "vocals": {"config": vocals_cfg, "ckpt": vocals_ckpt, "model_type": "mel_band_roformer"},
         "karaoke": {"config": karaoke_cfg, "ckpt": karaoke_ckpt, "model_type": "mel_band_roformer"},
     }
+    print(
+        json.dumps(
+            {
+                "event": "infer_stem_models_locked",
+                "profile": "rvc_ai_cover_maker",
+                "vocals": {
+                    "name": INFER_FIXED_VOCALS_MODEL,
+                    "configUrl": VOCALS_MODEL_CONFIG_URL,
+                    "ckptUrl": VOCALS_MODEL_CKPT_URL,
+                    "configPath": str(vocals_cfg),
+                    "ckptPath": str(vocals_ckpt),
+                },
+                "karaoke": {
+                    "name": INFER_FIXED_KARAOKE_MODEL,
+                    "configUrl": KARAOKE_MODEL_CONFIG_URL,
+                    "ckptUrl": KARAOKE_MODEL_CKPT_URL,
+                    "configPath": str(karaoke_cfg),
+                    "ckptPath": str(karaoke_ckpt),
+                },
+                "dereverb": {"name": INFER_FIXED_DEREVERB_MODEL, "modelFile": UVR_MODEL_FILE_DEREVERB},
+                "deecho": {"name": INFER_FIXED_DEECHO_MODEL, "modelFile": UVR_MODEL_FILE_DEECHO},
+                "denoiseEnabled": False,
+            }
+        )
+    )
+    return models
 
 
 def run_music_separation(input_path: Path, store_dir: Path, model_type: str, config_path: Path, ckpt_path: Path, use_tta: bool):
@@ -1791,19 +1800,21 @@ def handler(job):
     print(json.dumps({"event": "runner_build", "build": RUNNER_BUILD}))
     log_runtime_dependency_info()
 
-    ensure_applio()
-    ensure_cover_applio()
-    validate_forced_sample_rate()
-
     bucket = require_env("R2_BUCKET")
     inp = (job or {}).get("input") or {}
     mode = str(inp.get("mode") or "train").strip().lower()
     client = s3()
 
     if mode == "infer":
+        ensure_cover_applio()
+        print(json.dumps({"event": "runtime_mode_source", "mode": "infer", "source": str(APPLIO_COVER_DIR)}))
         return handle_infer_job(job=job or {}, inp=inp, client=client, bucket=bucket)
     if mode != "train":
         raise RuntimeError(f"Unsupported mode: {mode}")
+
+    ensure_applio()
+    validate_forced_sample_rate()
+    print(json.dumps({"event": "runtime_mode_source", "mode": "train", "source": str(APPLIO_DIR)}))
 
     preferred_precision = FORCE_TRAINING_PRECISION
     effective_precision = force_applio_precision(preferred_precision)
