@@ -54,9 +54,12 @@ APPLIO_COVER_ROOT = Path("/app")
 APPLIO_COVER_DIR = APPLIO_COVER_ROOT / "programs" / "applio_code"
 WORK_DIR = Path("/workspace")
 PREREQ_MARKER = APPLIO_DIR / ".prerequisites_ready"
+PREREQ_LOCK_FILE = APPLIO_DIR / ".prerequisites.lock"
+PREREQ_LOCK_STALE_SEC = int(os.environ.get("PREREQ_LOCK_STALE_SEC", "10800"))
+PREREQ_LOCK_WAIT_TIMEOUT_SEC = int(os.environ.get("PREREQ_LOCK_WAIT_TIMEOUT_SEC", "1800"))
 MUSIC_SEPARATION_DIR = Path("/app/music_separation_code")
 MUSIC_MODELS_DIR = Path("/app/music_separation_models")
-RUNNER_BUILD = "stemflow-20260223-infer-phase2-v16"
+RUNNER_BUILD = "stemflow-20260223-infer-phase2-v17"
 
 # Always use these advanced pretrained weights (32k).
 # Downloaded on demand and cached per worker at /content/Applio/pretrained_custom/*.pth
@@ -529,6 +532,178 @@ def ensure_applio():
             print(json.dumps({"event": "applio_alias_created", "alias": str(app_rvc_alias), "target": str(applio_rvc)}))
         except Exception as e:
             print(json.dumps({"event": "applio_alias_create_failed", "alias": str(app_rvc_alias), "error": str(e)[:300]}))
+
+
+def _training_prereq_required_files():
+    return [
+        (APPLIO_DIR / "rvc" / "models" / "predictors" / "rmvpe.pt", 1_000_000),
+        (APPLIO_DIR / "rvc" / "models" / "embedders" / "contentvec" / "pytorch_model.bin", 1_000_000),
+        (APPLIO_DIR / "rvc" / "models" / "embedders" / "contentvec" / "config.json", 200),
+    ]
+
+
+def validate_training_prerequisites():
+    missing = []
+    for path, min_bytes in _training_prereq_required_files():
+        try:
+            if not path.exists() or path.stat().st_size < min_bytes:
+                missing.append({"path": str(path), "minBytes": min_bytes, "bytes": path.stat().st_size if path.exists() else 0})
+        except Exception:
+            missing.append({"path": str(path), "minBytes": min_bytes, "bytes": None})
+    return {"ok": len(missing) == 0, "missing": missing}
+
+
+def _write_prereq_marker(payload: dict):
+    PREREQ_MARKER.parent.mkdir(parents=True, exist_ok=True)
+    tmp = PREREQ_MARKER.with_suffix(".tmp")
+    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    tmp.replace(PREREQ_MARKER)
+
+
+@contextmanager
+def acquire_prereq_lock():
+    start = time.time()
+    wait_logged_at = 0.0
+    acquired = False
+
+    while True:
+        try:
+            fd = os.open(str(PREREQ_LOCK_FILE), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            meta = {
+                "pid": os.getpid(),
+                "acquiredAt": int(time.time()),
+                "runnerBuild": RUNNER_BUILD,
+            }
+            os.write(fd, (json.dumps(meta) + "\n").encode("utf-8"))
+            os.close(fd)
+            acquired = True
+            print(json.dumps({"event": "applio_prerequisites_lock_acquired", "lock": str(PREREQ_LOCK_FILE)}))
+            break
+        except FileExistsError:
+            try:
+                age = time.time() - PREREQ_LOCK_FILE.stat().st_mtime
+                if age > PREREQ_LOCK_STALE_SEC:
+                    print(
+                        json.dumps(
+                            {
+                                "event": "applio_prerequisites_lock_stale_removed",
+                                "lock": str(PREREQ_LOCK_FILE),
+                                "ageSec": int(age),
+                            }
+                        )
+                    )
+                    PREREQ_LOCK_FILE.unlink(missing_ok=True)
+                    continue
+            except FileNotFoundError:
+                continue
+
+            now = time.time()
+            if now - wait_logged_at >= 10:
+                print(
+                    json.dumps(
+                        {
+                            "event": "applio_prerequisites_lock_wait",
+                            "lock": str(PREREQ_LOCK_FILE),
+                            "waitedSec": int(now - start),
+                        }
+                    )
+                )
+                wait_logged_at = now
+
+            if now - start > PREREQ_LOCK_WAIT_TIMEOUT_SEC:
+                raise RuntimeError(
+                    f"Timed out waiting for prerequisites lock after {int(now - start)}s: {PREREQ_LOCK_FILE}"
+                )
+            time.sleep(2)
+
+    try:
+        yield
+    finally:
+        if acquired:
+            try:
+                PREREQ_LOCK_FILE.unlink(missing_ok=True)
+                print(json.dumps({"event": "applio_prerequisites_lock_released", "lock": str(PREREQ_LOCK_FILE)}))
+            except Exception as e:
+                print(
+                    json.dumps(
+                        {
+                            "event": "applio_prerequisites_lock_release_failed",
+                            "lock": str(PREREQ_LOCK_FILE),
+                            "error": str(e)[:300],
+                        }
+                    )
+                )
+
+
+def ensure_applio_prerequisites_ready():
+    ensure_applio()
+
+    validation = validate_training_prerequisites()
+    if PREREQ_MARKER.exists() and validation["ok"]:
+        print(json.dumps({"event": "applio_prerequisites_cache_hit", "marker": str(PREREQ_MARKER)}))
+        return
+
+    with acquire_prereq_lock():
+        validation = validate_training_prerequisites()
+        if PREREQ_MARKER.exists() and validation["ok"]:
+            print(json.dumps({"event": "applio_prerequisites_cache_hit_after_wait", "marker": str(PREREQ_MARKER)}))
+            return
+
+        if PREREQ_MARKER.exists() and not validation["ok"]:
+            print(
+                json.dumps(
+                    {
+                        "event": "applio_prerequisites_cache_invalid",
+                        "marker": str(PREREQ_MARKER),
+                        "missingCount": len(validation["missing"]),
+                    }
+                )
+            )
+            PREREQ_MARKER.unlink(missing_ok=True)
+
+        started = time.time()
+        print(json.dumps({"event": "applio_prerequisites_start"}))
+        run(
+            [
+                "python",
+                "core.py",
+                "prerequisites",
+                "--models",
+                "True",
+                "--pretraineds_hifigan",
+                "True",
+                "--exe",
+                "False",
+            ],
+            cwd=str(APPLIO_DIR),
+        )
+
+        validation = validate_training_prerequisites()
+        if not validation["ok"]:
+            raise RuntimeError(
+                "Applio prerequisites command completed but required files are missing: "
+                + json.dumps(validation["missing"], ensure_ascii=False)
+            )
+
+        marker_payload = {
+            "ready": True,
+            "createdAt": int(time.time()),
+            "runnerBuild": RUNNER_BUILD,
+            "requiredFiles": [
+                {"path": str(path), "minBytes": min_bytes}
+                for path, min_bytes in _training_prereq_required_files()
+            ],
+        }
+        _write_prereq_marker(marker_payload)
+        print(
+            json.dumps(
+                {
+                    "event": "applio_prerequisites_done",
+                    "elapsedSec": round(time.time() - started, 3),
+                    "marker": str(PREREQ_MARKER),
+                }
+            )
+        )
 
 
 def ensure_cover_applio():
@@ -2236,22 +2411,7 @@ def handler(job):
     # Defer dataset FLAC archiving until after training artifact is uploaded.
     # This keeps training startup path focused on clone-critical steps.
 
-    print(json.dumps({"event": "applio_prerequisites_start"}))
-    run(
-        [
-            "python",
-            "core.py",
-            "prerequisites",
-            "--models",
-            "True",
-            "--pretraineds_hifigan",
-            "True",
-            "--exe",
-            "False",
-        ],
-        cwd=str(APPLIO_DIR),
-    )
-    print(json.dumps({"event": "applio_prerequisites_done"}))
+    ensure_applio_prerequisites_ready()
 
     # Applio's CLI limits cpu_cores to a fixed range (commonly max 64).
     # Some RunPod machines report higher counts (e.g. 128), which would crash.
