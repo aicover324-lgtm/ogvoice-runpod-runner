@@ -26,6 +26,21 @@ except Exception:
     _TORCH_AVAILABLE = False
 
 try:
+    import numpy as np  # type: ignore
+
+    # Compatibility for older inference code that still references removed aliases.
+    if not hasattr(np, "int"):
+        np.int = int  # type: ignore[attr-defined]
+    if not hasattr(np, "float"):
+        np.float = float  # type: ignore[attr-defined]
+    if not hasattr(np, "bool"):
+        np.bool = bool  # type: ignore[attr-defined]
+    if not hasattr(np, "complex"):
+        np.complex = complex  # type: ignore[attr-defined]
+except Exception:
+    np = None  # type: ignore
+
+try:
     from audio_separator.separator import Separator  # type: ignore
 
     _AUDIO_SEPARATOR_AVAILABLE = True
@@ -41,7 +56,7 @@ WORK_DIR = Path("/workspace")
 PREREQ_MARKER = APPLIO_DIR / ".prerequisites_ready"
 MUSIC_SEPARATION_DIR = Path("/app/music_separation_code")
 MUSIC_MODELS_DIR = Path("/app/music_separation_models")
-RUNNER_BUILD = "stemflow-20260223-infer-phase2-v9"
+RUNNER_BUILD = "stemflow-20260223-infer-phase2-v10"
 
 # Always use these advanced pretrained weights (32k).
 # Downloaded on demand and cached per worker at /content/Applio/pretrained_custom/*.pth
@@ -1098,6 +1113,25 @@ def get_audio_sample_rate(path: Path):
     return 44100
 
 
+def get_audio_duration_seconds(path: Path):
+    try:
+        out = run(
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-show_entries",
+                "format=duration",
+                "-of",
+                "default=noprint_wrappers=1:nokey=1",
+                str(path),
+            ]
+        )
+        return float(str(out).strip().splitlines()[0])
+    except Exception:
+        return None
+
+
 def build_atempo_filters(target_ratio: float):
     ratio = float(target_ratio)
     if ratio <= 0:
@@ -1209,6 +1243,27 @@ def recover_rvc_output(
     # Applio sometimes writes output into CWD or with a rewritten extension/name.
     # Recover by probing likely locations and normalizing to requested output path.
     exts = (".wav", ".flac", ".mp3", ".ogg", ".m4a", ".aac")
+    output_stem = output_audio_path.stem.lower()
+    input_duration = get_audio_duration_seconds(input_audio_path)
+    duration_cache = {}
+
+    def candidate_allowed(path: Path):
+        name = path.name.lower()
+        if re.match(r"^chunk\d+\.", name):
+            return False
+        if "_timestamps" in name:
+            return False
+        # Avoid split-work directories masquerading as final output.
+        if re.search(r"[\\/](chunk\d+|segments?)[\\/]", str(path).lower()):
+            return False
+        if input_duration is not None:
+            if path not in duration_cache:
+                duration_cache[path] = get_audio_duration_seconds(path)
+            cand_duration = duration_cache[path]
+            if cand_duration is not None and cand_duration < max(3.0, input_duration * 0.60):
+                return False
+        return True
+
     probe_candidates = []
     for root in (
         output_audio_path.parent,
@@ -1232,6 +1287,8 @@ def recover_rvc_output(
         seen.add(key)
         try:
             if cand.exists() and cand.stat().st_size > 0:
+                if not candidate_allowed(cand):
+                    continue
                 if cand.resolve() != output_audio_path.resolve():
                     shutil.copyfile(cand, output_audio_path)
                 print(
@@ -1267,6 +1324,8 @@ def recover_rvc_output(
             if st.st_size <= 0:
                 continue
             if st.st_mtime < (started_at - 3):
+                continue
+            if not candidate_allowed(p):
                 continue
             recent.append((st.st_mtime, p))
         recent.sort(key=lambda x: x[0], reverse=True)
@@ -1308,6 +1367,11 @@ def recover_rvc_output(
                 if st.st_size <= 0:
                     continue
                 if st.st_mtime < (started_at - 3):
+                    continue
+                name = p.name.lower()
+                if output_stem not in name and "output" not in name and "rvc" not in name:
+                    continue
+                if not candidate_allowed(p):
                     continue
                 recent_any.append((st.st_mtime, st.st_size, p))
         recent_any.sort(key=lambda x: (x[0], x[1]), reverse=True)

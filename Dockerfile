@@ -88,6 +88,25 @@ else:
     print('No patch needed for', p)
 PY
 
+# Compatibility patch for NumPy>=1.24 where np.int alias is removed.
+RUN python - <<'PY'
+from pathlib import Path
+
+p = Path('/app/programs/applio_code/rvc/infer/pipeline.py')
+if not p.exists():
+    raise RuntimeError(f'Missing file: {p}')
+
+text = p.read_text(encoding='utf-8')
+orig = text
+text = text.replace('astype(np.int)', 'astype(int)')
+
+if text != orig:
+    p.write_text(text, encoding='utf-8')
+    print('Patched', p, 'np.int -> int')
+else:
+    print('No np.int patch needed for', p)
+PY
+
 # Install Applio requirements.
 # IMPORTANT: include PyTorch cu128 index so torch==2.7.1+cu128 resolves.
 RUN pip install --upgrade pip \
