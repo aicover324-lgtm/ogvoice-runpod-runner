@@ -39,7 +39,7 @@ WORK_DIR = Path("/workspace")
 PREREQ_MARKER = APPLIO_DIR / ".prerequisites_ready"
 MUSIC_SEPARATION_DIR = Path("/app/music_separation_code")
 MUSIC_MODELS_DIR = Path("/app/music_separation_models")
-RUNNER_BUILD = "stemflow-20260223-infer-phase2-v2"
+RUNNER_BUILD = "stemflow-20260223-infer-phase2-v3"
 
 # Always use these advanced pretrained weights (32k).
 # Downloaded on demand and cached per worker at /content/Applio/pretrained_custom/*.pth
@@ -985,6 +985,7 @@ def convert_with_rvc(
 ):
     vc = get_voice_converter()
     output_audio_path.parent.mkdir(parents=True, exist_ok=True)
+    started_at = time.time()
     with pushd(APPLIO_DIR):
         vc.convert_audio(
             audio_input_path=str(input_audio_path),
@@ -1005,6 +1006,93 @@ def convert_with_rvc(
             export_format=INFER_DEFAULT_EXPORT_FORMAT,
             embedder_model_custom=None,
         )
+
+    if output_audio_path.exists() and output_audio_path.stat().st_size > 0:
+        return
+
+    # Applio sometimes writes output into CWD or with a rewritten extension/name.
+    # Recover by probing likely locations and normalizing to requested output path.
+    exts = (".wav", ".flac", ".mp3", ".ogg", ".m4a", ".aac")
+    probe_candidates = []
+    for root in (
+        output_audio_path.parent,
+        APPLIO_DIR,
+        APPLIO_DIR / "assets",
+        APPLIO_DIR / "outputs",
+        APPLIO_DIR / "audios",
+    ):
+        for ext in exts:
+            probe_candidates.append(root / f"{output_audio_path.stem}{ext}")
+        probe_candidates.append(root / output_audio_path.name)
+
+    seen = set()
+    for cand in probe_candidates:
+        key = str(cand)
+        if key in seen:
+            continue
+        seen.add(key)
+        try:
+            if cand.exists() and cand.stat().st_size > 0:
+                if cand.resolve() != output_audio_path.resolve():
+                    shutil.copyfile(cand, output_audio_path)
+                print(
+                    json.dumps(
+                        {
+                            "event": "infer_rvc_output_recovered",
+                            "from": str(cand),
+                            "to": str(output_audio_path),
+                            "bytes": output_audio_path.stat().st_size if output_audio_path.exists() else None,
+                        }
+                    )
+                )
+                if output_audio_path.exists() and output_audio_path.stat().st_size > 0:
+                    return
+        except Exception:
+            continue
+
+    # Last-resort: scan Applio tree for recently-written audio that matches output stem.
+    stem = output_audio_path.stem.lower()
+    recent = []
+    try:
+        for p in APPLIO_DIR.rglob("*"):
+            if not p.is_file():
+                continue
+            suffix = p.suffix.lower()
+            if suffix not in exts:
+                continue
+            name = p.name.lower()
+            if stem not in name:
+                continue
+            st = p.stat()
+            if st.st_size <= 0:
+                continue
+            if st.st_mtime < (started_at - 3):
+                continue
+            recent.append((st.st_mtime, p))
+        recent.sort(key=lambda x: x[0], reverse=True)
+    except Exception:
+        recent = []
+
+    if recent:
+        cand = recent[0][1]
+        shutil.copyfile(cand, output_audio_path)
+        print(
+            json.dumps(
+                {
+                    "event": "infer_rvc_output_recovered_recent",
+                    "from": str(cand),
+                    "to": str(output_audio_path),
+                    "bytes": output_audio_path.stat().st_size if output_audio_path.exists() else None,
+                }
+            )
+        )
+        if output_audio_path.exists() and output_audio_path.stat().st_size > 0:
+            return
+
+    raise RuntimeError(
+        "RVC conversion completed but output file is missing: "
+        f"{output_audio_path} (checked expected path, common Applio output dirs, and recent files)"
+    )
 
 
 def mix_tracks(main_vocal_path: Path, instrumental_path: Path, output_path: Path, backing_vocal_path: Path | None = None):
