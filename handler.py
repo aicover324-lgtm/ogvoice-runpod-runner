@@ -5,6 +5,7 @@ import subprocess
 import zipfile
 import time
 import re
+import sys
 from collections import deque
 from pathlib import Path
 from urllib.request import Request, urlopen
@@ -26,6 +27,8 @@ except Exception:
 APPLIO_DIR = Path("/content/Applio")
 WORK_DIR = Path("/workspace")
 PREREQ_MARKER = APPLIO_DIR / ".prerequisites_ready"
+MUSIC_SEPARATION_DIR = Path("/app/music_separation_code")
+MUSIC_MODELS_DIR = Path("/app/music_separation_models")
 
 # Always use these advanced pretrained weights (32k).
 # Downloaded on demand and cached per worker at /content/Applio/pretrained_custom/*.pth
@@ -73,6 +76,37 @@ FORCE_PROCESS_EFFECTS = True
 # Noise settings:
 # - noise reduction: off
 FORCE_NOISE_REDUCTION = False
+
+# Inference defaults and model sources (phase-1 cover pipeline).
+INFER_DEFAULT_EXPORT_FORMAT = "WAV"
+INFER_DEFAULT_PITCH_EXTRACTOR = "rmvpe"
+INFER_DEFAULT_EMBEDDER = "contentvec"
+INFER_DEFAULT_FILTER_RADIUS = 3
+INFER_DEFAULT_INDEX_RATE = 0.75
+INFER_DEFAULT_RMS_MIX_RATE = 0.25
+INFER_DEFAULT_PROTECT = 0.33
+INFER_DEFAULT_HOP_LENGTH = 64
+INFER_DEFAULT_SPLIT_AUDIO = False
+INFER_DEFAULT_AUTOTUNE = False
+INFER_DEFAULT_USE_TTA = False
+INFER_DEFAULT_BATCH_SIZE = 1
+
+VOCALS_MODEL_CONFIG_URL = os.environ.get(
+    "VOCALS_MODEL_CONFIG_URL",
+    "https://raw.githubusercontent.com/ZFTurbo/Music-Source-Separation-Training/main/configs/KimberleyJensen/config_vocals_mel_band_roformer_kj.yaml",
+)
+VOCALS_MODEL_CKPT_URL = os.environ.get(
+    "VOCALS_MODEL_CKPT_URL",
+    "https://huggingface.co/KimberleyJSN/melbandroformer/resolve/main/MelBandRoformer.ckpt",
+)
+KARAOKE_MODEL_CONFIG_URL = os.environ.get(
+    "KARAOKE_MODEL_CONFIG_URL",
+    "https://huggingface.co/shiromiya/audio-separation-models/resolve/main/mel_band_roformer_karaoke_aufr33_viperx/config_mel_band_roformer_karaoke.yaml",
+)
+KARAOKE_MODEL_CKPT_URL = os.environ.get(
+    "KARAOKE_MODEL_CKPT_URL",
+    "https://huggingface.co/shiromiya/audio-separation-models/resolve/main/mel_band_roformer_karaoke_aufr33_viperx/mel_band_roformer_karaoke_aufr33_viperx_sdr_10.1956.ckpt",
+)
 
 
 def require_env(name: str) -> str:
@@ -572,8 +606,339 @@ def clear_model_logs(model_name: str):
         shutil.rmtree(logs_dir, ignore_errors=True)
 
 
+_VOICE_CONVERTER_INSTANCE = None
+
+
+def as_dict(value):
+    return value if isinstance(value, dict) else {}
+
+
+def get_voice_converter():
+    global _VOICE_CONVERTER_INSTANCE
+    if _VOICE_CONVERTER_INSTANCE is not None:
+        return _VOICE_CONVERTER_INSTANCE
+
+    applio_path = str(APPLIO_DIR)
+    if applio_path not in sys.path:
+        sys.path.append(applio_path)
+    from rvc.infer.infer import VoiceConverter  # type: ignore
+
+    _VOICE_CONVERTER_INSTANCE = VoiceConverter()
+    return _VOICE_CONVERTER_INSTANCE
+
+
+def ensure_music_separation_models():
+    vocals_dir = MUSIC_MODELS_DIR / "vocals_mel_roformer"
+    karaoke_dir = MUSIC_MODELS_DIR / "karaoke_mel_roformer"
+    vocals_cfg = vocals_dir / "config.yaml"
+    vocals_ckpt = vocals_dir / "model.ckpt"
+    karaoke_cfg = karaoke_dir / "config.yaml"
+    karaoke_ckpt = karaoke_dir / "model.ckpt"
+
+    if not vocals_cfg.exists():
+        download_file_http(VOCALS_MODEL_CONFIG_URL, vocals_cfg, min_bytes=200)
+    if not vocals_ckpt.exists() or vocals_ckpt.stat().st_size < 5_000_000:
+        download_file_http(VOCALS_MODEL_CKPT_URL, vocals_ckpt, min_bytes=5_000_000)
+
+    if not karaoke_cfg.exists():
+        download_file_http(KARAOKE_MODEL_CONFIG_URL, karaoke_cfg, min_bytes=200)
+    if not karaoke_ckpt.exists() or karaoke_ckpt.stat().st_size < 5_000_000:
+        download_file_http(KARAOKE_MODEL_CKPT_URL, karaoke_ckpt, min_bytes=5_000_000)
+
+    return {
+        "vocals": {"config": vocals_cfg, "ckpt": vocals_ckpt, "model_type": "mel_band_roformer"},
+        "karaoke": {"config": karaoke_cfg, "ckpt": karaoke_ckpt, "model_type": "mel_band_roformer"},
+    }
+
+
+def run_music_separation(input_path: Path, store_dir: Path, model_type: str, config_path: Path, ckpt_path: Path, use_tta: bool):
+    store_dir.mkdir(parents=True, exist_ok=True)
+    cmd = [
+        "python",
+        str(MUSIC_SEPARATION_DIR / "inference.py"),
+        "--model_type",
+        model_type,
+        "--config_path",
+        str(config_path),
+        "--start_check_point",
+        str(ckpt_path),
+        "--input_file",
+        str(input_path),
+        "--store_dir",
+        str(store_dir),
+        "--flac_file",
+        "--pcm_type",
+        "PCM_16",
+        "--extract_instrumental",
+    ]
+    if use_tta:
+        cmd.append("--use_tta")
+
+    if _TORCH_AVAILABLE and torch is not None and torch.cuda.is_available():
+        cmd += ["--device_ids", "0"]
+    else:
+        cmd.append("--force_cpu")
+
+    run(cmd, cwd=str(WORK_DIR))
+
+
+def find_stem_file(store_dir: Path, contains: str):
+    files = sorted(store_dir.glob("*.flac"), key=lambda p: p.stat().st_mtime, reverse=True)
+    for f in files:
+        if contains.lower() in f.name.lower():
+            return f
+    return None
+
+
+def extract_model_artifact(model_zip_path: Path, extract_dir: Path):
+    if extract_dir.exists():
+        shutil.rmtree(extract_dir, ignore_errors=True)
+    extract_dir.mkdir(parents=True, exist_ok=True)
+
+    with zipfile.ZipFile(model_zip_path, "r") as zf:
+        zf.extractall(extract_dir)
+
+    pth_candidates = sorted(
+        [p for p in extract_dir.rglob("*.pth") if not p.name.startswith(("G_", "D_"))],
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+    if not pth_candidates:
+        raise RuntimeError("Model artifact does not include a valid .pth file.")
+
+    index_candidates = sorted(
+        [p for p in extract_dir.rglob("*.index") if "trained" not in p.name.lower()],
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+
+    return {
+        "model_path": pth_candidates[0],
+        "index_path": index_candidates[0] if index_candidates else None,
+    }
+
+
+def convert_with_rvc(
+    input_audio_path: Path,
+    output_audio_path: Path,
+    model_path: Path,
+    index_path: Path | None,
+    rvc_cfg: dict,
+):
+    vc = get_voice_converter()
+    output_audio_path.parent.mkdir(parents=True, exist_ok=True)
+    vc.convert_audio(
+        audio_input_path=str(input_audio_path),
+        audio_output_path=str(output_audio_path),
+        model_path=str(model_path),
+        index_path=str(index_path) if index_path else "",
+        embedder_model=str(rvc_cfg.get("embedderModel") or INFER_DEFAULT_EMBEDDER),
+        pitch=as_int(rvc_cfg.get("pitch"), 0),
+        f0_file=None,
+        f0_method=str(rvc_cfg.get("pitchExtractor") or INFER_DEFAULT_PITCH_EXTRACTOR),
+        filter_radius=as_int(rvc_cfg.get("filterRadius"), INFER_DEFAULT_FILTER_RADIUS),
+        index_rate=as_float(rvc_cfg.get("searchFeatureRatio"), INFER_DEFAULT_INDEX_RATE),
+        volume_envelope=as_float(rvc_cfg.get("volumeEnvelope"), INFER_DEFAULT_RMS_MIX_RATE),
+        protect=as_float(rvc_cfg.get("protectVoicelessConsonants"), INFER_DEFAULT_PROTECT),
+        split_audio=as_bool(rvc_cfg.get("splitAudio"), INFER_DEFAULT_SPLIT_AUDIO),
+        f0_autotune=as_bool(rvc_cfg.get("autotune"), INFER_DEFAULT_AUTOTUNE),
+        hop_length=as_int(rvc_cfg.get("hopLength"), INFER_DEFAULT_HOP_LENGTH),
+        export_format=INFER_DEFAULT_EXPORT_FORMAT,
+        embedder_model_custom=None,
+    )
+
+
+def mix_tracks(main_vocal_path: Path, instrumental_path: Path, output_path: Path, backing_vocal_path: Path | None = None):
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-i",
+        str(main_vocal_path),
+        "-i",
+        str(instrumental_path),
+    ]
+    if backing_vocal_path:
+        cmd += ["-i", str(backing_vocal_path)]
+        filter_complex = "[0:a][1:a][2:a]amix=inputs=3:duration=longest:normalize=0[mix]"
+    else:
+        filter_complex = "[0:a][1:a]amix=inputs=2:duration=longest:normalize=0[mix]"
+
+    cmd += [
+        "-filter_complex",
+        filter_complex,
+        "-map",
+        "[mix]",
+        "-ar",
+        "44100",
+        "-ac",
+        "2",
+        str(output_path),
+    ]
+    run(cmd)
+
+
+def upload_if_present(client, bucket: str, local_path: Path | None, key: str | None):
+    if not local_path or not key:
+        return
+    if not local_path.exists() or local_path.stat().st_size == 0:
+        return
+    client.upload_file(str(local_path), bucket, key)
+
+
+def handle_infer_job(job: dict, inp: dict, client, bucket: str):
+    if "inputAudioKey" not in inp and "inputStorageKey" not in inp:
+        raise RuntimeError("Missing required input: inputAudioKey")
+    if "modelArtifactKey" not in inp:
+        raise RuntimeError("Missing required input: modelArtifactKey")
+    if "outKey" not in inp:
+        raise RuntimeError("Missing required input: outKey")
+
+    input_audio_key = str(inp.get("inputAudioKey") or inp.get("inputStorageKey"))
+    model_artifact_key = str(inp.get("modelArtifactKey"))
+    out_key = str(inp.get("outKey"))
+    config = as_dict(inp.get("config"))
+    rvc_cfg = as_dict(config.get("rvc"))
+    sep_cfg = as_dict(config.get("audioSeparation"))
+    stem_keys = as_dict(inp.get("stemKeys"))
+
+    add_back_vocals = as_bool(sep_cfg.get("addBackVocals"), False)
+    convert_back_vocals = (
+        str(sep_cfg.get("backVocalMode") or "").strip().lower() == "convert"
+        or as_bool(rvc_cfg.get("inferBackingVocals"), False)
+    ) and add_back_vocals
+    use_tta = as_bool(sep_cfg.get("useTta"), INFER_DEFAULT_USE_TTA)
+
+    infer_precision = os.environ.get("APPLIO_INFER_PRECISION", "fp16").strip().lower()
+    force_applio_precision(infer_precision)
+
+    gpu = get_gpu_diagnostics()
+    print(json.dumps({"event": "infer_gpu_diagnostics", **gpu}))
+
+    model_defs = ensure_music_separation_models()
+
+    req_id = str((job or {}).get("id") or inp.get("jobId") or f"infer_{int(time.time())}")
+    work_dir = WORK_DIR / "infer" / req_id
+    if work_dir.exists():
+        shutil.rmtree(work_dir, ignore_errors=True)
+    work_dir.mkdir(parents=True, exist_ok=True)
+
+    input_audio_path = work_dir / "input_audio.wav"
+    model_zip_path = work_dir / "model.zip"
+    model_extract_dir = work_dir / "model_artifact"
+    stems_vocals_dir = work_dir / "stems_vocals"
+    stems_karaoke_dir = work_dir / "stems_karaoke"
+    output_dir = work_dir / "output"
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    print(json.dumps({"event": "infer_download_start", "inputAudioKey": input_audio_key, "modelArtifactKey": model_artifact_key}))
+    client.download_file(bucket, input_audio_key, str(input_audio_path))
+    client.download_file(bucket, model_artifact_key, str(model_zip_path))
+    if not input_audio_path.exists() or input_audio_path.stat().st_size < 1024:
+        raise RuntimeError("Input audio is missing or empty.")
+    if not model_zip_path.exists() or model_zip_path.stat().st_size < 1024:
+        raise RuntimeError("Model artifact zip is missing or empty.")
+    print(json.dumps({"event": "infer_download_done", "inputBytes": input_audio_path.stat().st_size, "modelZipBytes": model_zip_path.stat().st_size}))
+
+    model_info = extract_model_artifact(model_zip_path, model_extract_dir)
+    model_path = model_info["model_path"]
+    index_path = model_info["index_path"]
+    print(json.dumps({"event": "infer_model_ready", "modelPath": str(model_path), "indexPath": str(index_path) if index_path else None}))
+
+    print(json.dumps({"event": "infer_separation_vocals_start"}))
+    run_music_separation(
+        input_path=input_audio_path,
+        store_dir=stems_vocals_dir,
+        model_type=model_defs["vocals"]["model_type"],
+        config_path=model_defs["vocals"]["config"],
+        ckpt_path=model_defs["vocals"]["ckpt"],
+        use_tta=use_tta,
+    )
+    vocals_stem = find_stem_file(stems_vocals_dir, "_vocals")
+    instrumental_stem = find_stem_file(stems_vocals_dir, "_instrumental")
+    if not vocals_stem or not instrumental_stem:
+        raise RuntimeError("Could not find separated vocals/instrumental stems.")
+    print(json.dumps({"event": "infer_separation_vocals_done", "vocalsStem": vocals_stem.name, "instrumentalStem": instrumental_stem.name}))
+
+    backing_stem = None
+    if add_back_vocals:
+        print(json.dumps({"event": "infer_separation_backing_start"}))
+        run_music_separation(
+            input_path=vocals_stem,
+            store_dir=stems_karaoke_dir,
+            model_type=model_defs["karaoke"]["model_type"],
+            config_path=model_defs["karaoke"]["config"],
+            ckpt_path=model_defs["karaoke"]["ckpt"],
+            use_tta=use_tta,
+        )
+        backing_stem = find_stem_file(stems_karaoke_dir, "_instrumental")
+        if not backing_stem:
+            print(json.dumps({"event": "infer_separation_backing_warn", "message": "backing stem missing, continuing without backing"}))
+        else:
+            print(json.dumps({"event": "infer_separation_backing_done", "backingStem": backing_stem.name}))
+
+    converted_main_vocals = output_dir / "main_vocals_converted.wav"
+    print(json.dumps({"event": "infer_rvc_main_start"}))
+    convert_with_rvc(
+        input_audio_path=vocals_stem,
+        output_audio_path=converted_main_vocals,
+        model_path=model_path,
+        index_path=index_path,
+        rvc_cfg=rvc_cfg,
+    )
+    print(json.dumps({"event": "infer_rvc_main_done", "output": converted_main_vocals.name}))
+
+    final_backing_stem = backing_stem
+    if convert_back_vocals and backing_stem:
+        converted_backing = output_dir / "back_vocals_converted.wav"
+        print(json.dumps({"event": "infer_rvc_backing_start"}))
+        convert_with_rvc(
+            input_audio_path=backing_stem,
+            output_audio_path=converted_backing,
+            model_path=model_path,
+            index_path=index_path,
+            rvc_cfg=rvc_cfg,
+        )
+        final_backing_stem = converted_backing
+        print(json.dumps({"event": "infer_rvc_backing_done", "output": converted_backing.name}))
+
+    final_mix_path = output_dir / "cover_final.wav"
+    print(json.dumps({"event": "infer_mix_start"}))
+    mix_tracks(
+        main_vocal_path=converted_main_vocals,
+        instrumental_path=instrumental_stem,
+        output_path=final_mix_path,
+        backing_vocal_path=final_backing_stem if add_back_vocals else None,
+    )
+    print(json.dumps({"event": "infer_mix_done", "output": final_mix_path.name, "bytes": final_mix_path.stat().st_size}))
+
+    print(json.dumps({"event": "infer_upload_start", "outKey": out_key}))
+    client.upload_file(str(final_mix_path), bucket, out_key)
+    upload_if_present(client, bucket, converted_main_vocals, stem_keys.get("mainVocalsKey"))
+    upload_if_present(client, bucket, instrumental_stem, stem_keys.get("instrumentalKey"))
+    upload_if_present(client, bucket, final_backing_stem if add_back_vocals else None, stem_keys.get("backVocalsKey"))
+    print(json.dumps({"event": "infer_upload_done"}))
+
+    return {
+        "ok": True,
+        "mode": "infer",
+        "outputKey": out_key,
+        "outputBytes": final_mix_path.stat().st_size if final_mix_path.exists() else None,
+        "stemKeys": {
+            "mainVocalsKey": stem_keys.get("mainVocalsKey"),
+            "backVocalsKey": stem_keys.get("backVocalsKey") if add_back_vocals else None,
+            "instrumentalKey": stem_keys.get("instrumentalKey"),
+        },
+        "modelArtifactKey": model_artifact_key,
+        "inputAudioKey": input_audio_key,
+    }
+
+
 def handler(job):
-    print(json.dumps({"event": "runner_build", "build": "stemflow-20260223-training-only-nocache-v11"}))
+    print(json.dumps({"event": "runner_build", "build": "stemflow-20260223-infer-phase1-v1"}))
     log_runtime_dependency_info()
 
     ensure_applio()
@@ -582,8 +947,10 @@ def handler(job):
     bucket = require_env("R2_BUCKET")
     inp = (job or {}).get("input") or {}
     mode = str(inp.get("mode") or "train").strip().lower()
+    client = s3()
+
     if mode == "infer":
-        raise RuntimeError("Inference mode has been removed from this runner by explicit request.")
+        return handle_infer_job(job=job or {}, inp=inp, client=client, bucket=bucket)
     if mode != "train":
         raise RuntimeError(f"Unsupported mode: {mode}")
 
@@ -594,8 +961,6 @@ def handler(job):
             f"Precision requirement mismatch for mode={mode}: "
             f"requested={preferred_precision}, effective={effective_precision}"
         )
-    client = s3()
-
     if "datasetKey" not in inp:
         raise RuntimeError("Missing required input: datasetKey")
     if "outKey" not in inp:
