@@ -1923,28 +1923,6 @@ def export_audio_format(src_wav_path: Path, output_path: Path, export_format: st
     )
 
 
-def normalize_stem_keys(raw: dict):
-    def clean(value):
-        if not isinstance(value, str):
-            return None
-        v = value.strip()
-        return v if v else None
-
-    return {
-        "mainVocalsKey": clean(raw.get("mainVocalsKey")),
-        "backVocalsKey": clean(raw.get("backVocalsKey")),
-        "instrumentalKey": clean(raw.get("instrumentalKey")),
-    }
-
-
-def upload_if_present(client, bucket: str, local_path: Path | None, key: str | None):
-    if not local_path or not key:
-        return
-    if not local_path.exists() or local_path.stat().st_size == 0:
-        return
-    client.upload_file(str(local_path), bucket, key)
-
-
 def handle_infer_job(job: dict, inp: dict, client, bucket: str):
     if "inputAudioKey" not in inp and "inputStorageKey" not in inp:
         raise RuntimeError("Missing required input: inputAudioKey")
@@ -1969,7 +1947,6 @@ def handle_infer_job(job: dict, inp: dict, client, bucket: str):
     rvc_cfg = config["rvc"]
     sep_cfg = config["audioSeparation"]
     post_cfg = config["postProcess"]
-    stem_keys = normalize_stem_keys(as_dict(inp.get("stemKeys")))
 
     add_back_vocals = as_bool(sep_cfg.get("addBackVocals"), False)
     use_tta = as_bool(sep_cfg.get("useTta"), INFER_DEFAULT_USE_TTA)
@@ -2193,9 +2170,6 @@ def handle_infer_job(job: dict, inp: dict, client, bucket: str):
 
     print(json.dumps({"event": "infer_upload_start", "outKey": out_key}))
     client.upload_file(str(final_upload_path), bucket, out_key)
-    upload_if_present(client, bucket, converted_main_vocals, stem_keys.get("mainVocalsKey"))
-    upload_if_present(client, bucket, instrumental_for_mix, stem_keys.get("instrumentalKey"))
-    upload_if_present(client, bucket, final_backing_stem if add_back_vocals else None, stem_keys.get("backVocalsKey"))
     print(json.dumps({"event": "infer_upload_done"}))
     output_bytes = final_upload_path.stat().st_size if final_upload_path.exists() else None
 
@@ -2211,11 +2185,6 @@ def handle_infer_job(job: dict, inp: dict, client, bucket: str):
         "mode": "infer",
         "outputKey": out_key,
         "outputBytes": output_bytes,
-        "stemKeys": {
-            "mainVocalsKey": stem_keys.get("mainVocalsKey"),
-            "backVocalsKey": stem_keys.get("backVocalsKey") if add_back_vocals else None,
-            "instrumentalKey": stem_keys.get("instrumentalKey"),
-        },
         "modelArtifactKey": model_artifact_key,
         "inputAudioKey": input_audio_key,
         "effectiveConfig": config,

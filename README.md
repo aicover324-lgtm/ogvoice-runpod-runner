@@ -15,10 +15,8 @@ Inference input expects:
 - `modelArtifactKey`
 - `outKey`
 - `config`
-- optional `stemKeys`
 
 Inference output returns:
 
 - `outputKey`
 - `outputBytes`
-- `stemKeys`
