@@ -56,7 +56,7 @@ WORK_DIR = Path("/workspace")
 PREREQ_MARKER = APPLIO_DIR / ".prerequisites_ready"
 MUSIC_SEPARATION_DIR = Path("/app/music_separation_code")
 MUSIC_MODELS_DIR = Path("/app/music_separation_models")
-RUNNER_BUILD = "stemflow-20260223-infer-phase2-v12"
+RUNNER_BUILD = "stemflow-20260223-infer-phase2-v13"
 
 # Always use these advanced pretrained weights (32k).
 # Downloaded on demand and cached per worker at /content/Applio/pretrained_custom/*.pth
@@ -120,10 +120,10 @@ INFER_DEFAULT_USE_TTA = False
 INFER_DEFAULT_BATCH_SIZE = 1
 
 # Stem-separation model sources are locked to RVC-AI-Cover-Maker references.
-VOCALS_MODEL_CONFIG_URL = "https://raw.githubusercontent.com/ZFTurbo/Music-Source-Separation-Training/main/configs/KimberleyJensen/config_vocals_mel_band_roformer_kj.yaml"
-VOCALS_MODEL_CKPT_URL = "https://huggingface.co/KimberleyJSN/melbandroformer/resolve/main/MelBandRoformer.ckpt"
-KARAOKE_MODEL_CONFIG_URL = "https://huggingface.co/shiromiya/audio-separation-models/resolve/main/mel_band_roformer_karaoke_aufr33_viperx/config_mel_band_roformer_karaoke.yaml"
-KARAOKE_MODEL_CKPT_URL = "https://huggingface.co/shiromiya/audio-separation-models/resolve/main/mel_band_roformer_karaoke_aufr33_viperx/mel_band_roformer_karaoke_aufr33_viperx_sdr_10.1956.ckpt"
+VOCALS_MODEL_CONFIG_URL = "https://huggingface.co/OrcunAICovers/stem_seperation/resolve/main/config_deux_becruily.yaml?download=true"
+VOCALS_MODEL_CKPT_URL = "https://huggingface.co/OrcunAICovers/stem_seperation/resolve/main/becruily_deux.ckpt?download=true"
+KARAOKE_MODEL_CONFIG_URL = "https://huggingface.co/OrcunAICovers/stem_seperation/resolve/main/config_karaoke_frazer_becruily.yaml?download=true"
+KARAOKE_MODEL_CKPT_URL = "https://huggingface.co/OrcunAICovers/stem_seperation/resolve/main/bs_roformer_karaoke_frazer_becruily.ckpt?download=true"
 
 UVR_MODEL_FILE_DEREVERB = "UVR-DeEcho-DeReverb.pth"
 UVR_MODEL_FILE_DEECHO = "UVR-De-Echo-Normal.pth"
@@ -133,8 +133,8 @@ COVER_RESOURCES_BASE_URL = "https://huggingface.co/IAHispano/Applio/resolve/main
 COVER_RMVPE_URL = f"{COVER_RESOURCES_BASE_URL}/predictors/rmvpe.pt"
 COVER_FCPE_URL = f"{COVER_RESOURCES_BASE_URL}/predictors/fcpe.pt"
 
-INFER_FIXED_VOCALS_MODEL = "Mel-Roformer"
-INFER_FIXED_KARAOKE_MODEL = "Mel-Roformer Karaoke"
+INFER_FIXED_VOCALS_MODEL = "mel-band-roformer-deux"
+INFER_FIXED_KARAOKE_MODEL = "bs_roformer_karaoke_frazer_becruily"
 INFER_FIXED_DEREVERB_MODEL = "UVR-Deecho-Dereverb"
 INFER_FIXED_DEECHO_MODEL = "UVR-Deecho-Normal"
 
@@ -972,7 +972,7 @@ def ensure_music_separation_models():
 
     models = {
         "vocals": {"config": vocals_cfg, "ckpt": vocals_ckpt, "model_type": "mel_band_roformer"},
-        "karaoke": {"config": karaoke_cfg, "ckpt": karaoke_ckpt, "model_type": "mel_band_roformer"},
+        "karaoke": {"config": karaoke_cfg, "ckpt": karaoke_ckpt, "model_type": "bs_roformer"},
     }
     print(
         json.dumps(

@@ -4,6 +4,8 @@ ENV DEBIAN_FRONTEND=noninteractive
 ENV PIP_NO_CACHE_DIR=1
 ENV PIP_DISABLE_PIP_VERSION_CHECK=1
 WORKDIR /app
+ARG PRELOAD_INFER_ASSETS=0
+ARG PRELOAD_INFER_STRICT=0
 
 # System deps
 # - build-essential: gcc/g++ needed for webrtcvad build
@@ -32,33 +34,41 @@ RUN git clone https://github.com/Eddycrack864/RVC-AI-Cover-Maker-UI --depth 1 /t
   && test -f /app/music_separation_code/inference.py \
   && rm -rf /tmp/rvc_cover
 
-# Deterministic preload of fixed inference assets so workers don't download
-# large model files during requests.
+# Optional deterministic preload of fixed inference assets.
+# Default is OFF to avoid build failures due transient network/CDN issues.
 RUN python - <<'PY'
 from pathlib import Path
 from urllib.request import Request, urlopen
+import os
 import time
+
+preload_enabled = os.environ.get("PRELOAD_INFER_ASSETS", "0") == "1"
+strict = os.environ.get("PRELOAD_INFER_STRICT", "0") == "1"
+
+if not preload_enabled:
+    print("Skipping optional asset preload (PRELOAD_INFER_ASSETS=0)")
+    raise SystemExit(0)
 
 assets = [
     # Mel-Roformer vocals
     (
-        "https://raw.githubusercontent.com/ZFTurbo/Music-Source-Separation-Training/main/configs/KimberleyJensen/config_vocals_mel_band_roformer_kj.yaml",
+        "https://huggingface.co/OrcunAICovers/stem_seperation/resolve/main/config_deux_becruily.yaml?download=true",
         "/app/music_separation_models/vocals_mel_roformer/config.yaml",
         200,
     ),
     (
-        "https://huggingface.co/KimberleyJSN/melbandroformer/resolve/main/MelBandRoformer.ckpt",
+        "https://huggingface.co/OrcunAICovers/stem_seperation/resolve/main/becruily_deux.ckpt?download=true",
         "/app/music_separation_models/vocals_mel_roformer/model.ckpt",
         5_000_000,
     ),
     # Mel-Roformer karaoke
     (
-        "https://huggingface.co/shiromiya/audio-separation-models/resolve/main/mel_band_roformer_karaoke_aufr33_viperx/config_mel_band_roformer_karaoke.yaml",
+        "https://huggingface.co/OrcunAICovers/stem_seperation/resolve/main/config_karaoke_frazer_becruily.yaml?download=true",
         "/app/music_separation_models/karaoke_mel_roformer/config.yaml",
         200,
     ),
     (
-        "https://huggingface.co/shiromiya/audio-separation-models/resolve/main/mel_band_roformer_karaoke_aufr33_viperx/mel_band_roformer_karaoke_aufr33_viperx_sdr_10.1956.ckpt",
+        "https://huggingface.co/OrcunAICovers/stem_seperation/resolve/main/bs_roformer_karaoke_frazer_becruily.ckpt?download=true",
         "/app/music_separation_models/karaoke_mel_roformer/model.ckpt",
         5_000_000,
     ),
@@ -99,7 +109,7 @@ assets = [
 def download(url: str, dest: Path, min_bytes: int):
     if dest.exists() and dest.stat().st_size >= min_bytes:
         print("cached", dest)
-        return
+        return True, None
     dest.parent.mkdir(parents=True, exist_ok=True)
     tmp = dest.with_suffix(dest.suffix + ".tmp")
     if tmp.exists():
@@ -120,16 +130,28 @@ def download(url: str, dest: Path, min_bytes: int):
                 dest.unlink()
             tmp.replace(dest)
             print("downloaded", dest)
-            return
+            return True, None
         except Exception as e:
             last = e
             if tmp.exists():
                 tmp.unlink()
             time.sleep(2 * (i + 1))
-    raise RuntimeError(f"failed to download {url}: {last}")
+    return False, last
 
+failures = []
 for url, path, min_bytes in assets:
-    download(url, Path(path), min_bytes)
+    ok, err = download(url, Path(path), min_bytes)
+    if not ok:
+        failures.append((url, str(err)))
+        print("WARN preload failed:", url, err)
+
+if failures and strict:
+    raise RuntimeError("asset preload failures in strict mode: " + "; ".join([u for u, _ in failures]))
+
+if failures:
+    print(f"asset preload completed with {len(failures)} non-fatal failures")
+else:
+    print("asset preload completed successfully")
 PY
 
 # Compatibility patch for BS-Roformer karaoke config variants.
