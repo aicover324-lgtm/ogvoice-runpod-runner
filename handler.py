@@ -8,6 +8,7 @@ import re
 import sys
 import logging
 from collections import deque
+from contextlib import contextmanager
 from pathlib import Path
 from urllib.request import Request, urlopen
 
@@ -257,6 +258,16 @@ def run_stream(cmd, cwd=None, on_line=None):
     if process.returncode != 0:
         tail_text = "\n".join(tail)[-8000:]
         raise RuntimeError(f"Command failed ({process.returncode}): {' '.join(cmd)}\n\n{tail_text}")
+
+
+@contextmanager
+def pushd(path: Path):
+    prev_cwd = Path.cwd()
+    os.chdir(path)
+    try:
+        yield
+    finally:
+        os.chdir(prev_cwd)
 
 
 def extract_epoch_progress(line, total_epoch):
@@ -734,12 +745,14 @@ def get_voice_converter():
     if _VOICE_CONVERTER_INSTANCE is not None:
         return _VOICE_CONVERTER_INSTANCE
 
+    ensure_applio()
     applio_path = str(APPLIO_DIR)
     if applio_path not in sys.path:
         sys.path.append(applio_path)
-    from rvc.infer.infer import VoiceConverter  # type: ignore
+    with pushd(APPLIO_DIR):
+        from rvc.infer.infer import VoiceConverter  # type: ignore
 
-    _VOICE_CONVERTER_INSTANCE = VoiceConverter()
+        _VOICE_CONVERTER_INSTANCE = VoiceConverter()
     return _VOICE_CONVERTER_INSTANCE
 
 
@@ -960,25 +973,26 @@ def convert_with_rvc(
 ):
     vc = get_voice_converter()
     output_audio_path.parent.mkdir(parents=True, exist_ok=True)
-    vc.convert_audio(
-        audio_input_path=str(input_audio_path),
-        audio_output_path=str(output_audio_path),
-        model_path=str(model_path),
-        index_path=str(index_path) if index_path else "",
-        embedder_model=str(rvc_cfg.get("embedderModel") or INFER_DEFAULT_EMBEDDER),
-        pitch=as_int(rvc_cfg.get("pitch"), 0),
-        f0_file=None,
-        f0_method=str(rvc_cfg.get("pitchExtractor") or INFER_DEFAULT_PITCH_EXTRACTOR),
-        filter_radius=as_int(rvc_cfg.get("filterRadius"), INFER_DEFAULT_FILTER_RADIUS),
-        index_rate=as_float(rvc_cfg.get("searchFeatureRatio"), INFER_DEFAULT_INDEX_RATE),
-        volume_envelope=as_float(rvc_cfg.get("volumeEnvelope"), INFER_DEFAULT_RMS_MIX_RATE),
-        protect=as_float(rvc_cfg.get("protectVoicelessConsonants"), INFER_DEFAULT_PROTECT),
-        split_audio=as_bool(rvc_cfg.get("splitAudio"), INFER_DEFAULT_SPLIT_AUDIO),
-        f0_autotune=as_bool(rvc_cfg.get("autotune"), INFER_DEFAULT_AUTOTUNE),
-        hop_length=as_int(rvc_cfg.get("hopLength"), INFER_DEFAULT_HOP_LENGTH),
-        export_format=INFER_DEFAULT_EXPORT_FORMAT,
-        embedder_model_custom=None,
-    )
+    with pushd(APPLIO_DIR):
+        vc.convert_audio(
+            audio_input_path=str(input_audio_path),
+            audio_output_path=str(output_audio_path),
+            model_path=str(model_path),
+            index_path=str(index_path) if index_path else "",
+            embedder_model=str(rvc_cfg.get("embedderModel") or INFER_DEFAULT_EMBEDDER),
+            pitch=as_int(rvc_cfg.get("pitch"), 0),
+            f0_file=None,
+            f0_method=str(rvc_cfg.get("pitchExtractor") or INFER_DEFAULT_PITCH_EXTRACTOR),
+            filter_radius=as_int(rvc_cfg.get("filterRadius"), INFER_DEFAULT_FILTER_RADIUS),
+            index_rate=as_float(rvc_cfg.get("searchFeatureRatio"), INFER_DEFAULT_INDEX_RATE),
+            volume_envelope=as_float(rvc_cfg.get("volumeEnvelope"), INFER_DEFAULT_RMS_MIX_RATE),
+            protect=as_float(rvc_cfg.get("protectVoicelessConsonants"), INFER_DEFAULT_PROTECT),
+            split_audio=as_bool(rvc_cfg.get("splitAudio"), INFER_DEFAULT_SPLIT_AUDIO),
+            f0_autotune=as_bool(rvc_cfg.get("autotune"), INFER_DEFAULT_AUTOTUNE),
+            hop_length=as_int(rvc_cfg.get("hopLength"), INFER_DEFAULT_HOP_LENGTH),
+            export_format=INFER_DEFAULT_EXPORT_FORMAT,
+            embedder_model_custom=None,
+        )
 
 
 def mix_tracks(main_vocal_path: Path, instrumental_path: Path, output_path: Path, backing_vocal_path: Path | None = None):
