@@ -56,7 +56,7 @@ WORK_DIR = Path("/workspace")
 PREREQ_MARKER = APPLIO_DIR / ".prerequisites_ready"
 MUSIC_SEPARATION_DIR = Path("/app/music_separation_code")
 MUSIC_MODELS_DIR = Path("/app/music_separation_models")
-RUNNER_BUILD = "stemflow-20260223-infer-phase2-v15"
+RUNNER_BUILD = "stemflow-20260223-infer-phase2-v16"
 
 # Always use these advanced pretrained weights (32k).
 # Downloaded on demand and cached per worker at /content/Applio/pretrained_custom/*.pth
@@ -684,6 +684,18 @@ def download_file_http(
         tmp.unlink()
 
     last_err = None
+    print(
+        json.dumps(
+            {
+                "event": "http_download_start",
+                "dest": str(dest),
+                "url": url,
+                "retries": retries,
+                "timeoutSec": timeout_sec,
+                "minBytes": min_bytes,
+            }
+        )
+    )
     for i in range(retries):
         try:
             req = Request(url, headers={"User-Agent": "ogvoice-runpod-runner/1.0"})
@@ -691,12 +703,33 @@ def download_file_http(
                 if getattr(r, "status", 200) >= 400:
                     raise RuntimeError(f"HTTP {getattr(r, 'status', '???')} while downloading {url}")
 
+                expected_len = None
+                try:
+                    cl = r.headers.get("Content-Length")
+                    expected_len = int(cl) if cl else None
+                except Exception:
+                    expected_len = None
+
                 with open(tmp, "wb") as f:
+                    written = 0
+                    last_progress_mark = 0
                     while True:
                         chunk = r.read(1024 * 1024)
                         if not chunk:
                             break
                         f.write(chunk)
+                        written += len(chunk)
+                        # Progress every 64MB to avoid log spam.
+                        if written - last_progress_mark >= 64 * 1024 * 1024:
+                            last_progress_mark = written
+                            payload = {
+                                "event": "http_download_progress",
+                                "dest": str(dest),
+                                "bytes": written,
+                            }
+                            if expected_len:
+                                payload["totalBytes"] = expected_len
+                            print(json.dumps(payload))
 
             if not tmp.exists() or tmp.stat().st_size < min_bytes:
                 raise RuntimeError(f"Downloaded file too small: {tmp.stat().st_size if tmp.exists() else 0} bytes")
@@ -704,9 +737,29 @@ def download_file_http(
             if dest.exists():
                 dest.unlink()
             tmp.replace(dest)
+            print(
+                json.dumps(
+                    {
+                        "event": "http_download_done",
+                        "dest": str(dest),
+                        "bytes": dest.stat().st_size if dest.exists() else 0,
+                    }
+                )
+            )
             return
         except Exception as e:
             last_err = e
+            print(
+                json.dumps(
+                    {
+                        "event": "http_download_retry",
+                        "dest": str(dest),
+                        "attempt": i + 1,
+                        "maxAttempts": retries,
+                        "error": str(e)[:600],
+                    }
+                )
+            )
             try:
                 if tmp.exists():
                     tmp.unlink()
@@ -996,16 +1049,31 @@ def ensure_music_separation_models():
     dereverb_model = UVR_MODELS_DIR / UVR_MODEL_FILE_DEREVERB
 
     if not vocals_cfg.exists():
+        print(json.dumps({"event": "infer_model_asset_missing", "asset": "vocals_config", "path": str(vocals_cfg)}))
         download_file_http(VOCALS_MODEL_CONFIG_URL, vocals_cfg, min_bytes=200)
+    else:
+        print(json.dumps({"event": "infer_model_asset_cached", "asset": "vocals_config", "path": str(vocals_cfg)}))
     if not vocals_ckpt.exists() or vocals_ckpt.stat().st_size < 5_000_000:
+        print(json.dumps({"event": "infer_model_asset_missing", "asset": "vocals_ckpt", "path": str(vocals_ckpt)}))
         download_file_http(VOCALS_MODEL_CKPT_URL, vocals_ckpt, min_bytes=5_000_000)
+    else:
+        print(json.dumps({"event": "infer_model_asset_cached", "asset": "vocals_ckpt", "path": str(vocals_ckpt)}))
 
     if not karaoke_cfg.exists():
+        print(json.dumps({"event": "infer_model_asset_missing", "asset": "karaoke_config", "path": str(karaoke_cfg)}))
         download_file_http(KARAOKE_MODEL_CONFIG_URL, karaoke_cfg, min_bytes=200)
+    else:
+        print(json.dumps({"event": "infer_model_asset_cached", "asset": "karaoke_config", "path": str(karaoke_cfg)}))
     if not karaoke_ckpt.exists() or karaoke_ckpt.stat().st_size < 5_000_000:
+        print(json.dumps({"event": "infer_model_asset_missing", "asset": "karaoke_ckpt", "path": str(karaoke_ckpt)}))
         download_file_http(KARAOKE_MODEL_CKPT_URL, karaoke_ckpt, min_bytes=5_000_000)
+    else:
+        print(json.dumps({"event": "infer_model_asset_cached", "asset": "karaoke_ckpt", "path": str(karaoke_ckpt)}))
     if not dereverb_model.exists() or dereverb_model.stat().st_size < 5_000_000:
+        print(json.dumps({"event": "infer_model_asset_missing", "asset": "dereverb_model", "path": str(dereverb_model)}))
         download_file_http(UVR_MODEL_DEREVERB_URL, dereverb_model, min_bytes=5_000_000)
+    else:
+        print(json.dumps({"event": "infer_model_asset_cached", "asset": "dereverb_model", "path": str(dereverb_model)}))
 
     models = {
         "vocals": {"config": vocals_cfg, "ckpt": vocals_ckpt, "model_type": "mel_band_roformer"},
@@ -1050,9 +1118,16 @@ def warmup_infer_runtime():
         return
 
     started = time.time()
+    print(json.dumps({"event": "infer_runtime_warmup_start"}))
+    print(json.dumps({"event": "infer_runtime_warmup_step_start", "step": "ensure_cover_applio"}))
     ensure_cover_applio()
+    print(json.dumps({"event": "infer_runtime_warmup_step_done", "step": "ensure_cover_applio"}))
+    print(json.dumps({"event": "infer_runtime_warmup_step_start", "step": "ensure_music_separation_models"}))
     ensure_music_separation_models()
+    print(json.dumps({"event": "infer_runtime_warmup_step_done", "step": "ensure_music_separation_models"}))
+    print(json.dumps({"event": "infer_runtime_warmup_step_start", "step": "get_voice_converter"}))
     get_voice_converter()
+    print(json.dumps({"event": "infer_runtime_warmup_step_done", "step": "get_voice_converter"}))
     _INFER_RUNTIME_WARMED = True
     print(
         json.dumps(
@@ -1727,7 +1802,6 @@ def handle_infer_job(job: dict, inp: dict, client, bucket: str):
 
     infer_precision = os.environ.get("APPLIO_INFER_PRECISION", "fp16").strip().lower()
     force_cover_applio_precision(infer_precision)
-    warmup_infer_runtime()
 
     gpu = get_gpu_diagnostics()
     print(json.dumps({"event": "infer_gpu_diagnostics", **gpu}))
@@ -1745,6 +1819,7 @@ def handle_infer_job(job: dict, inp: dict, client, bucket: str):
             }
         )
     )
+    warmup_infer_runtime()
 
     model_defs = ensure_music_separation_models()
 
