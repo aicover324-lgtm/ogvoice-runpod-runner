@@ -59,7 +59,7 @@ PREREQ_LOCK_STALE_SEC = int(os.environ.get("PREREQ_LOCK_STALE_SEC", "10800"))
 PREREQ_LOCK_WAIT_TIMEOUT_SEC = int(os.environ.get("PREREQ_LOCK_WAIT_TIMEOUT_SEC", "1800"))
 MUSIC_SEPARATION_DIR = Path("/app/music_separation_code")
 MUSIC_MODELS_DIR = Path("/app/music_separation_models")
-RUNNER_BUILD = "stemflow-20260224-infer-preload-splitaudio-v2"
+RUNNER_BUILD = "stemflow-20260224-infer-gpu-strict-v3"
 
 # Always use these advanced pretrained weights (32k).
 # Downloaded on demand and cached per worker at /content/Applio/pretrained_custom/*.pth
@@ -134,6 +134,13 @@ INFER_DEFAULT_CLEAN_STRENGTH = 0.5
 INFER_DEFAULT_POST_PROCESS = False
 INFER_DEFAULT_USE_TTA = False
 INFER_DEFAULT_BATCH_SIZE = 1
+INFER_REQUIRE_GPU = os.environ.get("INFER_REQUIRE_GPU", "1").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+    "y",
+    "on",
+)
 
 # Stem-separation model sources.
 VOCALS_MODEL_CONFIG_URL = "https://huggingface.co/OrcunAICovers/stem_seperation/resolve/main/seperation_models/vocals/config_deux_becruily.yaml?download=true"
@@ -228,7 +235,11 @@ def s3():
     )
 
 
-def run(cmd, cwd=None, timeout_sec=None):
+def run(cmd, cwd=None, timeout_sec=None, env=None):
+    proc_env = None
+    if env is not None:
+        proc_env = os.environ.copy()
+        proc_env.update({str(k): str(v) for k, v in env.items()})
     try:
         p = subprocess.run(
             cmd,
@@ -237,6 +248,7 @@ def run(cmd, cwd=None, timeout_sec=None):
             stderr=subprocess.STDOUT,
             text=True,
             timeout=timeout_sec,
+            env=proc_env,
         )
     except subprocess.TimeoutExpired as e:
         out = e.stdout if e.stdout is not None else e.output
@@ -1387,12 +1399,34 @@ def run_music_separation(input_path: Path, store_dir: Path, model_type: str, con
     if use_tta:
         cmd.append("--use_tta")
 
-    if _TORCH_AVAILABLE and torch is not None and torch.cuda.is_available():
+    cuda_available = bool(_TORCH_AVAILABLE and torch is not None and torch.cuda.is_available())
+    if INFER_REQUIRE_GPU and not cuda_available:
+        raise RuntimeError("GPU is required for stem separation, but CUDA is unavailable.")
+
+    child_env = {"CUDA_VISIBLE_DEVICES": "0"}
+    if cuda_available:
         cmd += ["--device_ids", "0"]
     else:
         cmd.append("--force_cpu")
 
-    run(cmd, cwd=str(WORK_DIR))
+    out = run(cmd, cwd=str(WORK_DIR), env=child_env)
+    device_match = re.search(r"Using device:\s*([^\r\n]+)", str(out))
+    reported_device = device_match.group(1).strip() if device_match else None
+    print(
+        json.dumps(
+            {
+                "event": "infer_stem_separation_device",
+                "modelType": model_type,
+                "reportedDevice": reported_device,
+                "cudaAvailable": cuda_available,
+                "requireGpu": INFER_REQUIRE_GPU,
+            }
+        )
+    )
+    if INFER_REQUIRE_GPU and (not reported_device or not reported_device.lower().startswith("cuda")):
+        raise RuntimeError(
+            f"Stem separation did not run on CUDA (reportedDevice={reported_device!r})."
+        )
 
 
 def run_uvr_single_stem(
@@ -1423,6 +1457,34 @@ def run_uvr_single_stem(
             "enable_tta": bool(use_tta),
         },
     )
+    sep_torch_device = str(getattr(separator, "torch_device", "") or "")
+    sep_ort_provider = getattr(separator, "onnx_execution_provider", None)
+    if isinstance(sep_ort_provider, (list, tuple)):
+        sep_ort_provider = [str(p) for p in sep_ort_provider]
+    elif sep_ort_provider is None:
+        sep_ort_provider = []
+    else:
+        sep_ort_provider = [str(sep_ort_provider)]
+
+    print(
+        json.dumps(
+            {
+                "event": "infer_uvr_device",
+                "torchDevice": sep_torch_device,
+                "onnxExecutionProvider": sep_ort_provider,
+                "requireGpu": INFER_REQUIRE_GPU,
+            }
+        )
+    )
+    uvr_on_cuda = "cuda" in sep_torch_device.lower() or any(
+        p in ("CUDAExecutionProvider", "TensorrtExecutionProvider")
+        for p in sep_ort_provider
+    )
+    if INFER_REQUIRE_GPU and not uvr_on_cuda:
+        raise RuntimeError(
+            f"UVR stage is not using GPU (torchDevice={sep_torch_device!r}, providers={sep_ort_provider})."
+        )
+
     separator.load_model(model_filename=model_filename)
     separator.separate(str(input_path))
 
@@ -2021,6 +2083,8 @@ def handle_infer_job(job: dict, inp: dict, client, bucket: str):
 
     gpu = get_gpu_diagnostics()
     print(json.dumps({"event": "infer_gpu_diagnostics", **gpu}))
+    if INFER_REQUIRE_GPU and not bool(gpu.get("cudaAvailable")):
+        raise RuntimeError("GPU is required for inference, but CUDA is unavailable.")
     print(
         json.dumps(
             {
