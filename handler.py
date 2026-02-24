@@ -59,7 +59,7 @@ PREREQ_LOCK_STALE_SEC = int(os.environ.get("PREREQ_LOCK_STALE_SEC", "10800"))
 PREREQ_LOCK_WAIT_TIMEOUT_SEC = int(os.environ.get("PREREQ_LOCK_WAIT_TIMEOUT_SEC", "1800"))
 MUSIC_SEPARATION_DIR = Path("/app/music_separation_code")
 MUSIC_MODELS_DIR = Path("/app/music_separation_models")
-RUNNER_BUILD = "stemflow-20260223-infer-phase2-v18"
+RUNNER_BUILD = "stemflow-20260224-infer-stem-cover-rvc-tmp-v1"
 
 # Always use these advanced pretrained weights (32k).
 # Downloaded on demand and cached per worker at /content/Applio/pretrained_custom/*.pth
@@ -120,13 +120,18 @@ APPLIO_TRAIN_CONFIG_URLS = {
 INFER_DEFAULT_EXPORT_FORMAT = "WAV"
 INFER_DEFAULT_PITCH_EXTRACTOR = "rmvpe"
 INFER_DEFAULT_EMBEDDER = "contentvec"
-INFER_DEFAULT_FILTER_RADIUS = 3
 INFER_DEFAULT_INDEX_RATE = 0.75
-INFER_DEFAULT_RMS_MIX_RATE = 0.25
-INFER_DEFAULT_PROTECT = 0.33
-INFER_DEFAULT_HOP_LENGTH = 64
+INFER_DEFAULT_RMS_MIX_RATE = 1.0
+INFER_DEFAULT_PROTECT = 0.5
+INFER_DEFAULT_HOP_LENGTH = 128
 INFER_DEFAULT_SPLIT_AUDIO = False
 INFER_DEFAULT_AUTOTUNE = False
+INFER_DEFAULT_AUTOTUNE_STRENGTH = 1.0
+INFER_DEFAULT_PROPOSED_PITCH = False
+INFER_DEFAULT_PROPOSED_PITCH_THRESHOLD = 155.0
+INFER_DEFAULT_CLEAN_AUDIO = False
+INFER_DEFAULT_CLEAN_STRENGTH = 0.5
+INFER_DEFAULT_POST_PROCESS = False
 INFER_DEFAULT_USE_TTA = False
 INFER_DEFAULT_BATCH_SIZE = 1
 
@@ -794,6 +799,42 @@ def ensure_cover_applio():
         print(json.dumps({"event": "cover_embedder_ready", "name": "contentvec_config", "path": str(contentvec_cfg_path)}))
 
 
+def ensure_tmp_applio_infer_assets():
+    ensure_applio()
+
+    predictors_dir = APPLIO_DIR / "rvc" / "models" / "predictors"
+    rmvpe_path = predictors_dir / "rmvpe.pt"
+    fcpe_path = predictors_dir / "fcpe.pt"
+    if not rmvpe_path.exists() or rmvpe_path.stat().st_size < 1_000_000:
+        download_file_http(COVER_RMVPE_URL, rmvpe_path, retries=3, timeout_sec=180, min_bytes=1_000_000)
+        print(json.dumps({"event": "infer_predictor_ready", "name": "rmvpe", "path": str(rmvpe_path)}))
+    if not fcpe_path.exists() or fcpe_path.stat().st_size < 1_000_000:
+        download_file_http(COVER_FCPE_URL, fcpe_path, retries=3, timeout_sec=180, min_bytes=1_000_000)
+        print(json.dumps({"event": "infer_predictor_ready", "name": "fcpe", "path": str(fcpe_path)}))
+
+    contentvec_dir = APPLIO_DIR / "rvc" / "models" / "embedders" / "contentvec"
+    contentvec_bin_path = contentvec_dir / "pytorch_model.bin"
+    contentvec_cfg_path = contentvec_dir / "config.json"
+    if not contentvec_bin_path.exists() or contentvec_bin_path.stat().st_size < 1_000_000:
+        download_file_http(
+            COVER_CONTENTVEC_BIN_URL,
+            contentvec_bin_path,
+            retries=3,
+            timeout_sec=180,
+            min_bytes=1_000_000,
+        )
+        print(json.dumps({"event": "infer_embedder_ready", "name": "contentvec_bin", "path": str(contentvec_bin_path)}))
+    if not contentvec_cfg_path.exists() or contentvec_cfg_path.stat().st_size < 200:
+        download_file_http(
+            COVER_CONTENTVEC_CONFIG_URL,
+            contentvec_cfg_path,
+            retries=3,
+            timeout_sec=180,
+            min_bytes=200,
+        )
+        print(json.dumps({"event": "infer_embedder_ready", "name": "contentvec_config", "path": str(contentvec_cfg_path)}))
+
+
 def force_cover_applio_precision(preferred: str) -> str:
     ensure_cover_applio()
     requested = normalize_precision(preferred)
@@ -1132,16 +1173,25 @@ def normalize_rvc_config(raw: dict):
         "pitch": clamp_int(as_int(raw.get("pitch"), 0), -24, 24),
         "pitchExtractor": normalize_pitch_extractor(raw.get("pitchExtractor")),
         "embedderModel": normalize_embedder_model(raw.get("embedderModel")),
-        "filterRadius": clamp_int(as_int(raw.get("filterRadius"), INFER_DEFAULT_FILTER_RADIUS), 0, 7),
         "searchFeatureRatio": clamp_float(as_float(raw.get("searchFeatureRatio"), INFER_DEFAULT_INDEX_RATE), 0.0, 1.0),
         "volumeEnvelope": clamp_float(as_float(raw.get("volumeEnvelope"), INFER_DEFAULT_RMS_MIX_RATE), 0.0, 1.0),
         "protectVoicelessConsonants": clamp_float(
             as_float(raw.get("protectVoicelessConsonants"), INFER_DEFAULT_PROTECT), 0.0, 0.5
         ),
         "hopLength": clamp_int(as_int(raw.get("hopLength"), INFER_DEFAULT_HOP_LENGTH), 1, 512),
-        # Split-audio path is disabled for stability.
+        # Split-audio path is intentionally disabled in OG Voice.
         "splitAudio": False,
         "autotune": False,
+        "autotuneStrength": clamp_float(
+            as_float(raw.get("autotuneStrength"), INFER_DEFAULT_AUTOTUNE_STRENGTH), 0.0, 1.0
+        ),
+        "proposedPitch": as_bool(raw.get("proposedPitch"), INFER_DEFAULT_PROPOSED_PITCH),
+        "proposedPitchThreshold": clamp_float(
+            as_float(raw.get("proposedPitchThreshold"), INFER_DEFAULT_PROPOSED_PITCH_THRESHOLD), 50.0, 1200.0
+        ),
+        "cleanAudio": as_bool(raw.get("cleanAudio"), INFER_DEFAULT_CLEAN_AUDIO),
+        "cleanStrength": clamp_float(as_float(raw.get("cleanStrength"), INFER_DEFAULT_CLEAN_STRENGTH), 0.0, 1.0),
+        "postProcess": as_bool(raw.get("postProcess"), INFER_DEFAULT_POST_PROCESS),
         "inferBackingVocals": False,
     }
 
@@ -1187,12 +1237,12 @@ def get_voice_converter():
     if _VOICE_CONVERTER_INSTANCE is not None:
         return _VOICE_CONVERTER_INSTANCE
 
-    ensure_cover_applio()
-    cover_root = str(APPLIO_COVER_ROOT)
-    if cover_root not in sys.path:
-        sys.path.append(cover_root)
-    with pushd(APPLIO_COVER_ROOT):
-        from programs.applio_code.rvc.infer.infer import VoiceConverter  # type: ignore
+    ensure_tmp_applio_infer_assets()
+    applio_root = str(APPLIO_DIR)
+    if applio_root not in sys.path:
+        sys.path.append(applio_root)
+    with pushd(APPLIO_DIR):
+        from rvc.infer.infer import VoiceConverter  # type: ignore
 
         _VOICE_CONVERTER_INSTANCE = VoiceConverter()
     return _VOICE_CONVERTER_INSTANCE
@@ -1295,9 +1345,9 @@ def warmup_infer_runtime():
 
     started = time.time()
     print(json.dumps({"event": "infer_runtime_warmup_start"}))
-    print(json.dumps({"event": "infer_runtime_warmup_step_start", "step": "ensure_cover_applio"}))
-    ensure_cover_applio()
-    print(json.dumps({"event": "infer_runtime_warmup_step_done", "step": "ensure_cover_applio"}))
+    print(json.dumps({"event": "infer_runtime_warmup_step_start", "step": "ensure_tmp_applio_infer_assets"}))
+    ensure_tmp_applio_infer_assets()
+    print(json.dumps({"event": "infer_runtime_warmup_step_done", "step": "ensure_tmp_applio_infer_assets"}))
     print(json.dumps({"event": "infer_runtime_warmup_step_start", "step": "ensure_music_separation_models"}))
     ensure_music_separation_models()
     print(json.dumps({"event": "infer_runtime_warmup_step_done", "step": "ensure_music_separation_models"}))
@@ -1788,25 +1838,33 @@ def convert_with_rvc(
 
         try:
             vc = get_voice_converter()
-            with pushd(APPLIO_COVER_ROOT):
+            with pushd(APPLIO_DIR):
                 vc.convert_audio(
                     audio_input_path=str(attempt_input_path),
                     audio_output_path=str(output_audio_path),
                     model_path=str(model_path),
                     index_path=str(index_path) if index_path else "",
-                    embedder_model=str(rvc_cfg.get("embedderModel") or INFER_DEFAULT_EMBEDDER),
                     pitch=as_int(rvc_cfg.get("pitch"), 0),
-                    f0_file=None,
                     f0_method=str(rvc_cfg.get("pitchExtractor") or INFER_DEFAULT_PITCH_EXTRACTOR),
-                    filter_radius=as_int(rvc_cfg.get("filterRadius"), INFER_DEFAULT_FILTER_RADIUS),
                     index_rate=as_float(rvc_cfg.get("searchFeatureRatio"), INFER_DEFAULT_INDEX_RATE),
                     volume_envelope=as_float(rvc_cfg.get("volumeEnvelope"), INFER_DEFAULT_RMS_MIX_RATE),
                     protect=as_float(rvc_cfg.get("protectVoicelessConsonants"), INFER_DEFAULT_PROTECT),
-                    split_audio=False,
-                    f0_autotune=as_bool(rvc_cfg.get("autotune"), INFER_DEFAULT_AUTOTUNE),
                     hop_length=as_int(rvc_cfg.get("hopLength"), INFER_DEFAULT_HOP_LENGTH),
-                    export_format=INFER_DEFAULT_EXPORT_FORMAT,
+                    split_audio=as_bool(rvc_cfg.get("splitAudio"), INFER_DEFAULT_SPLIT_AUDIO),
+                    f0_autotune=as_bool(rvc_cfg.get("autotune"), INFER_DEFAULT_AUTOTUNE),
+                    f0_autotune_strength=as_float(
+                        rvc_cfg.get("autotuneStrength"), INFER_DEFAULT_AUTOTUNE_STRENGTH
+                    ),
+                    embedder_model=str(rvc_cfg.get("embedderModel") or INFER_DEFAULT_EMBEDDER),
                     embedder_model_custom=None,
+                    clean_audio=as_bool(rvc_cfg.get("cleanAudio"), INFER_DEFAULT_CLEAN_AUDIO),
+                    clean_strength=as_float(rvc_cfg.get("cleanStrength"), INFER_DEFAULT_CLEAN_STRENGTH),
+                    export_format=INFER_DEFAULT_EXPORT_FORMAT,
+                    post_process=as_bool(rvc_cfg.get("postProcess"), INFER_DEFAULT_POST_PROCESS),
+                    proposed_pitch=as_bool(rvc_cfg.get("proposedPitch"), INFER_DEFAULT_PROPOSED_PITCH),
+                    proposed_pitch_threshold=as_float(
+                        rvc_cfg.get("proposedPitchThreshold"), INFER_DEFAULT_PROPOSED_PITCH_THRESHOLD
+                    ),
                 )
         except Exception as e:
             failures.append(f"{attempt}: convert_exception={type(e).__name__}: {str(e)[:240]}")
@@ -1954,7 +2012,7 @@ def handle_infer_job(job: dict, inp: dict, client, bucket: str):
     instrumental_pitch = clamp_int(as_int(rvc_cfg.get("pitch"), 0), -24, 24)
 
     infer_precision = os.environ.get("APPLIO_INFER_PRECISION", "fp16").strip().lower()
-    force_cover_applio_precision(infer_precision)
+    force_applio_precision(infer_precision)
 
     gpu = get_gpu_diagnostics()
     print(json.dumps({"event": "infer_gpu_diagnostics", **gpu}))
@@ -1963,6 +2021,7 @@ def handle_infer_job(job: dict, inp: dict, client, bucket: str):
             {
                 "event": "infer_config_normalized",
                 "config": config,
+                "rvcRuntime": "tmp_applio",
                 "fixedModels": {
                     "vocalsModel": INFER_FIXED_VOCALS_MODEL,
                     "karaokeModel": INFER_FIXED_KARAOKE_MODEL,
@@ -2201,8 +2260,18 @@ def handler(job):
     client = s3()
 
     if mode == "infer":
-        ensure_cover_applio()
-        print(json.dumps({"event": "runtime_mode_source", "mode": "infer", "source": str(APPLIO_COVER_DIR)}))
+        ensure_tmp_applio_infer_assets()
+        print(
+            json.dumps(
+                {
+                    "event": "runtime_mode_source",
+                    "mode": "infer",
+                    "source": str(APPLIO_DIR),
+                    "stemSeparationSource": str(MUSIC_SEPARATION_DIR),
+                    "rvcSource": str(APPLIO_DIR / "rvc"),
+                }
+            )
+        )
         return handle_infer_job(job=job or {}, inp=inp, client=client, bucket=bucket)
     if mode != "train":
         raise RuntimeError(f"Unsupported mode: {mode}")
