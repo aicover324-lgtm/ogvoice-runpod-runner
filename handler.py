@@ -124,7 +124,7 @@ INFER_DEFAULT_INDEX_RATE = 0.75
 INFER_DEFAULT_RMS_MIX_RATE = 1.0
 INFER_DEFAULT_PROTECT = 0.5
 INFER_DEFAULT_HOP_LENGTH = 128
-INFER_DEFAULT_SPLIT_AUDIO = False
+INFER_DEFAULT_SPLIT_AUDIO = True
 INFER_DEFAULT_AUTOTUNE = False
 INFER_DEFAULT_AUTOTUNE_STRENGTH = 1.0
 INFER_DEFAULT_PROPOSED_PITCH = False
@@ -1179,8 +1179,7 @@ def normalize_rvc_config(raw: dict):
             as_float(raw.get("protectVoicelessConsonants"), INFER_DEFAULT_PROTECT), 0.0, 0.5
         ),
         "hopLength": clamp_int(as_int(raw.get("hopLength"), INFER_DEFAULT_HOP_LENGTH), 1, 512),
-        # Split-audio path is intentionally disabled in OG Voice.
-        "splitAudio": False,
+        "splitAudio": as_bool(raw.get("splitAudio"), INFER_DEFAULT_SPLIT_AUDIO),
         "autotune": False,
         "autotuneStrength": clamp_float(
             as_float(raw.get("autotuneStrength"), INFER_DEFAULT_AUTOTUNE_STRENGTH), 0.0, 1.0
@@ -1787,12 +1786,18 @@ def convert_with_rvc(
 ):
     output_audio_path.parent.mkdir(parents=True, exist_ok=True)
 
+    requested_split_audio = as_bool(
+        rvc_cfg.get("splitAudio"), INFER_DEFAULT_SPLIT_AUDIO
+    )
     attempts: list[tuple[str, Path, bool]] = [
-        ("primary_split_disabled", input_audio_path, False),
+        ("requested", input_audio_path, requested_split_audio),
     ]
 
     wav_input = output_audio_path.parent / f"{input_audio_path.stem}_for_rvc.wav"
-    attempts.append(("fallback_wav_input", wav_input, False))
+    attempts.append(("fallback_wav_input", wav_input, requested_split_audio))
+    if requested_split_audio:
+        attempts.append(("fallback_split_disabled", input_audio_path, False))
+        attempts.append(("fallback_wav_input_split_disabled", wav_input, False))
 
     failures = []
     for idx, (attempt, attempt_input_path, split_audio) in enumerate(attempts, start=1):
@@ -1850,7 +1855,7 @@ def convert_with_rvc(
                     volume_envelope=as_float(rvc_cfg.get("volumeEnvelope"), INFER_DEFAULT_RMS_MIX_RATE),
                     protect=as_float(rvc_cfg.get("protectVoicelessConsonants"), INFER_DEFAULT_PROTECT),
                     hop_length=as_int(rvc_cfg.get("hopLength"), INFER_DEFAULT_HOP_LENGTH),
-                    split_audio=as_bool(rvc_cfg.get("splitAudio"), INFER_DEFAULT_SPLIT_AUDIO),
+                    split_audio=bool(split_audio),
                     f0_autotune=as_bool(rvc_cfg.get("autotune"), INFER_DEFAULT_AUTOTUNE),
                     f0_autotune_strength=as_float(
                         rvc_cfg.get("autotuneStrength"), INFER_DEFAULT_AUTOTUNE_STRENGTH
