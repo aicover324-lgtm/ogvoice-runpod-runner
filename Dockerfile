@@ -4,8 +4,6 @@ ENV DEBIAN_FRONTEND=noninteractive
 ENV PIP_NO_CACHE_DIR=1
 ENV PIP_DISABLE_PIP_VERSION_CHECK=1
 WORKDIR /app
-ARG PRELOAD_INFER_ASSETS=0
-ARG PRELOAD_INFER_STRICT=0
 
 # System deps
 # - build-essential: gcc/g++ needed for webrtcvad build
@@ -34,20 +32,13 @@ RUN git clone https://github.com/Eddycrack864/RVC-AI-Cover-Maker-UI --depth 1 /t
   && test -f /app/music_separation_code/inference.py \
   && rm -rf /tmp/rvc_cover
 
-# Optional deterministic preload of fixed inference assets.
-# Default is OFF to avoid build failures due transient network/CDN issues.
+# Deterministic preload of fixed inference assets.
+# This bakes heavy models into the image so worker cold-start does not spend
+# minutes downloading predictors/embedders/separation checkpoints.
 RUN python - <<'PY'
 from pathlib import Path
 from urllib.request import Request, urlopen
-import os
 import time
-
-preload_enabled = os.environ.get("PRELOAD_INFER_ASSETS", "0") == "1"
-strict = os.environ.get("PRELOAD_INFER_STRICT", "0") == "1"
-
-if not preload_enabled:
-    print("Skipping optional asset preload (PRELOAD_INFER_ASSETS=0)")
-    raise SystemExit(0)
 
 assets = [
     # Mel-Roformer vocals
@@ -78,25 +69,25 @@ assets = [
         "/app/music_separation_models/uvr/UVR-DeEcho-DeReverb.pth",
         5_000_000,
     ),
-    # Cover Applio predictors and embedder
+    # tmp_applio predictors and embedder (active RVC runtime path)
     (
         "https://huggingface.co/OrcunAICovers/stem_seperation/resolve/main/seperation_models/RVC%20pitch%20predictors/rmvpe.pt?download=true",
-        "/app/programs/applio_code/rvc/models/predictors/rmvpe.pt",
+        "/content/Applio/rvc/models/predictors/rmvpe.pt",
         1_000_000,
     ),
     (
         "https://huggingface.co/OrcunAICovers/stem_seperation/resolve/main/seperation_models/RVC%20pitch%20predictors/fcpe.pt?download=true",
-        "/app/programs/applio_code/rvc/models/predictors/fcpe.pt",
+        "/content/Applio/rvc/models/predictors/fcpe.pt",
         1_000_000,
     ),
     (
         "https://huggingface.co/OrcunAICovers/stem_seperation/resolve/main/seperation_models/RVC%20embedder%20(contentvec)/pytorch_model.bin?download=true",
-        "/app/programs/applio_code/rvc/models/embedders/contentvec/pytorch_model.bin",
+        "/content/Applio/rvc/models/embedders/contentvec/pytorch_model.bin",
         1_000_000,
     ),
     (
         "https://huggingface.co/OrcunAICovers/stem_seperation/resolve/main/seperation_models/RVC%20embedder%20(contentvec)/Resources_embedders_contentvec_config.json?download=true",
-        "/app/programs/applio_code/rvc/models/embedders/contentvec/config.json",
+        "/content/Applio/rvc/models/embedders/contentvec/config.json",
         200,
     ),
 ]
@@ -110,10 +101,10 @@ def download(url: str, dest: Path, min_bytes: int):
     if tmp.exists():
         tmp.unlink()
     last = None
-    for i in range(3):
+    for i in range(5):
         try:
             req = Request(url, headers={"User-Agent": "ogvoice-runpod-runner/1.0"})
-            with urlopen(req, timeout=180) as r, open(tmp, "wb") as f:
+            with urlopen(req, timeout=300) as r, open(tmp, "wb") as f:
                 while True:
                     chunk = r.read(1024 * 1024)
                     if not chunk:
@@ -131,22 +122,12 @@ def download(url: str, dest: Path, min_bytes: int):
             if tmp.exists():
                 tmp.unlink()
             time.sleep(2 * (i + 1))
-    return False, last
+    raise RuntimeError(f"failed to download {url}: {last}")
 
-failures = []
 for url, path, min_bytes in assets:
-    ok, err = download(url, Path(path), min_bytes)
-    if not ok:
-        failures.append((url, str(err)))
-        print("WARN preload failed:", url, err)
+    download(url, Path(path), min_bytes)
 
-if failures and strict:
-    raise RuntimeError("asset preload failures in strict mode: " + "; ".join([u for u, _ in failures]))
-
-if failures:
-    print(f"asset preload completed with {len(failures)} non-fatal failures")
-else:
-    print("asset preload completed successfully")
+print("asset preload completed successfully")
 PY
 
 # Compatibility patch for BS-Roformer karaoke config variants.
@@ -244,8 +225,8 @@ RUN apt-get update \
 
 COPY handler.py /app/handler.py
 
-# Heavy model assets are fetched lazily by handler.py and cached per worker.
-# This keeps the container image smaller and reduces pull/extract delay.
+# Inference assets are preloaded into the image above to minimize cold-start
+# latency. Runtime download in handler.py stays as a safety fallback only.
 
 # Work dir for jobs
 RUN mkdir -p /workspace
