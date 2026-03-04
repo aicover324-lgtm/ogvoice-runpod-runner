@@ -205,6 +205,271 @@ else:
     print('No np.int patch needed for', p)
 PY
 
+# Training runtime tuning patch for Applio:
+# - Make DataLoader worker count configurable
+# - Limit thread fan-out inside DataLoader worker processes
+# This improves CPU-bound input pipeline stability without changing model quality.
+RUN python - <<'PY'
+from pathlib import Path
+
+p = Path('/content/Applio/rvc/train/train.py')
+if not p.exists():
+    raise RuntimeError(f'Missing file: {p}')
+
+text = p.read_text(encoding='utf-8')
+orig = text
+
+helper_marker = "def _int_env(name, default, min_value=None, max_value=None):"
+if helper_marker not in text:
+    anchor = "logging.getLogger(\"torch\").setLevel(logging.ERROR)\n"
+    if anchor not in text:
+        raise RuntimeError("Could not find logging anchor in train.py for helper insertion")
+    helper_block = '''logging.getLogger("torch").setLevel(logging.ERROR)
+
+
+def _int_env(name, default, min_value=None, max_value=None):
+    raw = os.environ.get(name)
+    if raw is None or str(raw).strip() == "":
+        value = int(default)
+    else:
+        try:
+            value = int(str(raw).strip())
+        except Exception:
+            value = int(default)
+    if min_value is not None:
+        value = max(int(min_value), value)
+    if max_value is not None:
+        value = min(int(max_value), value)
+    return int(value)
+
+
+def _available_cpu_count():
+    try:
+        return max(1, len(os.sched_getaffinity(0)))
+    except Exception:
+        return max(1, os.cpu_count() or 1)
+
+
+def _resolve_dataloader_workers():
+    available = _available_cpu_count()
+    default_workers = max(1, min(4, available))
+    return _int_env("OGV_DATALOADER_WORKERS", default_workers, min_value=0, max_value=available)
+
+
+def _worker_thread_limits():
+    return _int_env("OGV_DATALOADER_WORKER_THREADS", 1, min_value=1, max_value=4)
+
+
+def _dataloader_worker_init_fn(_worker_id):
+    worker_threads = _worker_thread_limits()
+    os.environ["OMP_NUM_THREADS"] = str(worker_threads)
+    os.environ["MKL_NUM_THREADS"] = str(worker_threads)
+    os.environ["OPENBLAS_NUM_THREADS"] = str(worker_threads)
+    os.environ["NUMEXPR_NUM_THREADS"] = str(worker_threads)
+    os.environ["VECLIB_MAXIMUM_THREADS"] = str(worker_threads)
+    try:
+        torch.set_num_threads(worker_threads)
+    except Exception:
+        pass
+    try:
+        torch.set_num_interop_threads(1)
+    except Exception:
+        pass
+'''
+    text = text.replace(anchor, helper_block, 1)
+
+old_loader_block = '''    train_loader = DataLoader(
+        train_dataset,
+        num_workers=4,
+        shuffle=False,
+        pin_memory=True,
+        collate_fn=collate_fn,
+        batch_sampler=train_sampler,
+        persistent_workers=True,
+        prefetch_factor=8,
+    )
+'''
+new_loader_block = '''    resolved_num_workers = _resolve_dataloader_workers()
+    resolved_prefetch_factor = _int_env(
+        "OGV_DATALOADER_PREFETCH_FACTOR", 8, min_value=1, max_value=32
+    )
+    resolved_worker_threads = _worker_thread_limits()
+    print(
+        "DataLoader config"
+        f" | workers={resolved_num_workers}"
+        f" | prefetch_factor={resolved_prefetch_factor if resolved_num_workers > 0 else 0}"
+        f" | worker_threads={resolved_worker_threads}"
+        " | pin_memory=True"
+    )
+
+    train_loader_kwargs = {
+        "dataset": train_dataset,
+        "num_workers": resolved_num_workers,
+        "shuffle": False,
+        "pin_memory": True,
+        "collate_fn": collate_fn,
+        "batch_sampler": train_sampler,
+        "persistent_workers": resolved_num_workers > 0,
+    }
+    if resolved_num_workers > 0:
+        train_loader_kwargs["prefetch_factor"] = resolved_prefetch_factor
+        train_loader_kwargs["worker_init_fn"] = _dataloader_worker_init_fn
+
+    train_loader = DataLoader(**train_loader_kwargs)
+'''
+if old_loader_block in text:
+    text = text.replace(old_loader_block, new_loader_block, 1)
+elif "train_loader = DataLoader(**train_loader_kwargs)" not in text:
+    raise RuntimeError("Could not patch DataLoader block in train.py")
+
+timing_block_old = '''    epoch_recorder = EpochRecorder()
+    with tqdm(total=len(train_loader), leave=False) as pbar:
+        for batch_idx, info in data_iterator:
+            if device.type == "cuda" and not cache_data_in_gpu:
+'''
+timing_block_new = '''    epoch_recorder = EpochRecorder()
+    # Timing instrumentation (no behavior change): helps detect CPU-bound input stalls.
+    timing_data_wait_total = 0.0
+    timing_h2d_total = 0.0
+    timing_compute_total = 0.0
+    timing_batches = 0
+    timing_prev_batch_end = ttime()
+    timing_sync_for_metrics = str(os.environ.get("OGV_TRAIN_TIMING_SYNC", "0")).strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "y",
+        "on",
+    )
+    with tqdm(total=len(train_loader), leave=False) as pbar:
+        for batch_idx, info in data_iterator:
+            timing_batch_start = ttime()
+            timing_data_wait_total += max(0.0, timing_batch_start - timing_prev_batch_end)
+
+            h2d_start = ttime()
+            if device.type == "cuda" and not cache_data_in_gpu:
+'''
+if timing_block_old in text:
+    text = text.replace(timing_block_old, timing_block_new, 1)
+elif "timing_data_wait_total = 0.0" not in text:
+    raise RuntimeError("Could not patch timing init block in train.py")
+
+compute_block_old = '''            else:
+                loss_gen_all.backward()
+                grad_norm_g = commons.grad_norm(net_g.parameters())
+                optim_g.step()
+
+            global_step += 1
+'''
+compute_block_new = '''            else:
+                loss_gen_all.backward()
+                grad_norm_g = commons.grad_norm(net_g.parameters())
+                optim_g.step()
+            if device.type == "cuda" and timing_sync_for_metrics:
+                # Optional strict GPU timing for diagnostics (disabled by default).
+                torch.cuda.synchronize(device_id)
+            timing_compute_total += max(0.0, ttime() - compute_start)
+            timing_batches += 1
+
+            global_step += 1
+'''
+if compute_block_old in text:
+    text = text.replace(compute_block_old, compute_block_new, 1)
+elif "timing_compute_total +=" not in text:
+    raise RuntimeError("Could not patch compute timing block in train.py")
+
+h2d_block_old = '''            elif device.type != "cuda":
+                info = [tensor.to(device) for tensor in info]
+            # else iterator is going thru a cached list with a device already assigned
+
+            (
+'''
+h2d_block_new = '''            elif device.type != "cuda":
+                info = [tensor.to(device) for tensor in info]
+            # else iterator is going thru a cached list with a device already assigned
+            timing_h2d_total += max(0.0, ttime() - h2d_start)
+
+            (
+'''
+if h2d_block_old in text:
+    text = text.replace(h2d_block_old, h2d_block_new, 1)
+elif "timing_h2d_total +=" not in text:
+    raise RuntimeError("Could not patch H2D timing block in train.py")
+
+forward_block_old = '''            with torch.amp.autocast(
+                device_type="cuda", enabled=use_amp, dtype=train_dtype
+            ):
+'''
+forward_block_new = '''            compute_start = ttime()
+            with torch.amp.autocast(
+                device_type="cuda", enabled=use_amp, dtype=train_dtype
+            ):
+'''
+if forward_block_old in text and "compute_start = ttime()" not in text:
+    text = text.replace(forward_block_old, forward_block_new, 1)
+
+pbar_block_old = '''            pbar.update(1)
+        # end of batch train
+'''
+pbar_block_new = '''            pbar.update(1)
+            timing_prev_batch_end = ttime()
+        # end of batch train
+'''
+if pbar_block_old in text:
+    text = text.replace(pbar_block_old, pbar_block_new, 1)
+elif "timing_prev_batch_end = ttime()" not in text:
+    raise RuntimeError("Could not patch pbar timing tail block in train.py")
+
+record_block_old = '''        if overtraining_detector:
+            remaining_epochs_gen = overtraining_threshold - consecutive_increases_gen
+            remaining_epochs_disc = (
+                overtraining_threshold * 2 - consecutive_increases_disc
+            )
+            record = (
+                record
+                + f" | Number of epochs remaining for overtraining: g/total: {remaining_epochs_gen} d/total: {remaining_epochs_disc} | smoothed_loss_gen={smoothed_value_gen:.3f} | smoothed_loss_disc={smoothed_value_disc:.3f}"
+            )
+        print(record)
+'''
+record_block_new = '''        if overtraining_detector:
+            remaining_epochs_gen = overtraining_threshold - consecutive_increases_gen
+            remaining_epochs_disc = (
+                overtraining_threshold * 2 - consecutive_increases_disc
+            )
+            record = (
+                record
+                + f" | Number of epochs remaining for overtraining: g/total: {remaining_epochs_gen} d/total: {remaining_epochs_disc} | smoothed_loss_gen={smoothed_value_gen:.3f} | smoothed_loss_disc={smoothed_value_disc:.3f}"
+            )
+        if timing_batches > 0:
+            data_wait_avg_ms = (timing_data_wait_total / timing_batches) * 1000.0
+            h2d_avg_ms = (timing_h2d_total / timing_batches) * 1000.0
+            compute_avg_ms = (timing_compute_total / timing_batches) * 1000.0
+            wait_to_compute_ratio = (
+                (timing_data_wait_total / timing_compute_total)
+                if timing_compute_total > 1e-9
+                else 0.0
+            )
+            record = (
+                record
+                + f" | data_wait_avg_ms={data_wait_avg_ms:.1f}"
+                + f" | h2d_avg_ms={h2d_avg_ms:.1f}"
+                + f" | gpu_compute_avg_ms={compute_avg_ms:.1f}"
+                + f" | wait_to_compute_ratio={wait_to_compute_ratio:.3f}"
+            )
+        print(record)
+'''
+if record_block_old in text:
+    text = text.replace(record_block_old, record_block_new, 1)
+elif "wait_to_compute_ratio=" not in text:
+    raise RuntimeError("Could not patch epoch record timing block in train.py")
+
+if text != orig:
+    p.write_text(text, encoding='utf-8')
+    print('Patched', p, 'for configurable DataLoader workers and worker thread limits')
+else:
+    print('No training tuning patch needed for', p)
+PY
+
 # Install Applio requirements.
 # IMPORTANT: include PyTorch cu128 index so torch==2.7.1+cu128 resolves.
 RUN pip install --upgrade pip \
