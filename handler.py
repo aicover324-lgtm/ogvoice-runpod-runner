@@ -100,6 +100,10 @@ EPOCH_PATTERNS = [
     re.compile(r"(?i)\bepoch\s*=\s*(\d+)\b"),
 ]
 TRAINING_SPEED_PATTERN = re.compile(r"(?i)training_speed\s*=\s*(\d{1,2}:\d{2}:\d{2})")
+TRAINING_STEP_PATTERN = re.compile(r"(?i)\bstep\s*=\s*(\d+)\b")
+DATA_WAIT_MS_PATTERN = re.compile(r"(?i)\bdata_wait_avg_ms\s*=\s*([0-9]+(?:\.[0-9]+)?)")
+GPU_COMPUTE_MS_PATTERN = re.compile(r"(?i)\bgpu_compute_avg_ms\s*=\s*([0-9]+(?:\.[0-9]+)?)")
+WAIT_TO_COMPUTE_RATIO_PATTERN = re.compile(r"(?i)\bwait_to_compute_ratio\s*=\s*([0-9]+(?:\.[0-9]+)?)")
 
 # "Noise filter" in Applio UI maps to the preprocess flag `--process_effects`.
 # This applies a simple filter during preprocessing.
@@ -356,6 +360,80 @@ def extract_training_speed_seconds(line):
     if h < 0 or m < 0 or m > 59 or s < 0 or s > 59:
         return None
     return h * 3600 + m * 60 + s
+
+
+def extract_training_step(line):
+    if not line:
+        return None
+    match = TRAINING_STEP_PATTERN.search(str(line))
+    if not match:
+        return None
+    try:
+        step = int(match.group(1))
+    except Exception:
+        return None
+    return step if step > 0 else None
+
+
+def extract_metric_float(line, pattern):
+    if not line:
+        return None
+    match = pattern.search(str(line))
+    if not match:
+        return None
+    try:
+        return float(match.group(1))
+    except Exception:
+        return None
+
+
+def read_cpu_model():
+    try:
+        cpuinfo = Path("/proc/cpuinfo")
+        if cpuinfo.exists():
+            for raw in cpuinfo.read_text(encoding="utf-8", errors="ignore").splitlines():
+                if raw.lower().startswith("model name"):
+                    _, value = raw.split(":", 1)
+                    return value.strip()
+    except Exception:
+        pass
+    try:
+        out = subprocess.run(
+            ["bash", "-lc", "lscpu | grep 'Model name:' | sed 's/Model name:\\s*//'"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=5,
+        )
+        text = (out.stdout or "").strip()
+        if text:
+            return text
+    except Exception:
+        pass
+    return None
+
+
+def get_worker_runtime_info():
+    return {
+        "hostname": os.environ.get("HOSTNAME") or None,
+        "workerId": os.environ.get("RUNPOD_WORKER_ID") or os.environ.get("RUNPOD_POD_ID") or None,
+        "location": os.environ.get("RUNPOD_REGION") or os.environ.get("RUNPOD_DC") or os.environ.get("RUNPOD_LOCATION") or None,
+        "publicIp": os.environ.get("RUNPOD_PUBLIC_IP") or None,
+        "cpuModel": read_cpu_model(),
+        "cpuCount": os.cpu_count(),
+    }
+
+
+def classify_first_epoch_performance(first_epoch_its, wait_to_compute_ratio, data_wait_avg_ms):
+    if first_epoch_its is None:
+        return "unknown"
+    ratio = wait_to_compute_ratio if wait_to_compute_ratio is not None else 0.0
+    wait_ms = data_wait_avg_ms if data_wait_avg_ms is not None else 0.0
+    if first_epoch_its >= 8.5 and ratio <= 0.02 and wait_ms <= 5.0:
+        return "healthy"
+    if first_epoch_its >= 6.5 and ratio <= 0.05 and wait_ms <= 12.0:
+        return "watch"
+    return "degraded"
 
 
 def upload_training_progress(client, bucket, progress_key, payload):
@@ -2439,6 +2517,19 @@ def handler(job):
 
     gpu = get_gpu_diagnostics()
     print(json.dumps({"event": "gpu_diagnostics", **gpu}))
+    runtime_info = get_worker_runtime_info()
+    print(
+        json.dumps(
+            {
+                "event": "training_runtime_profile",
+                **runtime_info,
+                "gpuName": gpu["deviceNames"][0] if gpu.get("deviceNames") else None,
+                "precision": effective_precision,
+                "batchSize": batch_size,
+                "totalEpoch": total_epoch,
+            }
+        )
+    )
     if not gpu.get("cudaAvailable"):
         raise RuntimeError(
             "CUDA is not available in this worker. "
@@ -2649,6 +2740,12 @@ def handler(job):
     epoch_durations = []
     steady_epoch_seconds = None
     first_epoch_seconds = None
+    first_epoch_its = None
+    first_epoch_step_count = None
+    first_epoch_data_wait_avg_ms = None
+    first_epoch_gpu_compute_avg_ms = None
+    first_epoch_wait_to_compute_ratio = None
+    first_epoch_performance_class = None
 
     upload_training_progress(
         client,
@@ -2671,6 +2768,8 @@ def handler(job):
 
     def on_train_line(line):
         nonlocal last_epoch_seen, last_epoch_timestamp, steady_epoch_seconds, first_epoch_seconds
+        nonlocal first_epoch_its, first_epoch_step_count, first_epoch_data_wait_avg_ms
+        nonlocal first_epoch_gpu_compute_avg_ms, first_epoch_wait_to_compute_ratio, first_epoch_performance_class
 
         epoch = extract_epoch_progress(line, total_epoch)
         if epoch is None or epoch <= last_epoch_seen:
@@ -2686,6 +2785,36 @@ def handler(job):
             epoch_durations.append(float(epoch_seconds))
             if epoch == 1 and first_epoch_seconds is None:
                 first_epoch_seconds = float(epoch_seconds)
+                step_count = extract_training_step(line)
+                if step_count is not None:
+                    first_epoch_step_count = step_count
+                    first_epoch_its = round(step_count / max(first_epoch_seconds, 0.001), 3)
+                first_epoch_data_wait_avg_ms = extract_metric_float(line, DATA_WAIT_MS_PATTERN)
+                first_epoch_gpu_compute_avg_ms = extract_metric_float(line, GPU_COMPUTE_MS_PATTERN)
+                first_epoch_wait_to_compute_ratio = extract_metric_float(line, WAIT_TO_COMPUTE_RATIO_PATTERN)
+                first_epoch_performance_class = classify_first_epoch_performance(
+                    first_epoch_its,
+                    first_epoch_wait_to_compute_ratio,
+                    first_epoch_data_wait_avg_ms,
+                )
+                print(
+                    json.dumps(
+                        {
+                            "event": "training_first_epoch_assessment",
+                            "epoch": 1,
+                            "firstEpochSeconds": round(first_epoch_seconds, 3),
+                            "firstEpochStepCount": first_epoch_step_count,
+                            "firstEpochIts": first_epoch_its,
+                            "dataWaitAvgMs": first_epoch_data_wait_avg_ms,
+                            "gpuComputeAvgMs": first_epoch_gpu_compute_avg_ms,
+                            "waitToComputeRatio": first_epoch_wait_to_compute_ratio,
+                            "performanceClass": first_epoch_performance_class,
+                            "workerLocation": runtime_info.get("location"),
+                            "cpuModel": runtime_info.get("cpuModel"),
+                            "hostname": runtime_info.get("hostname"),
+                        }
+                    )
+                )
 
         last_epoch_timestamp = now_ts
         last_epoch_seen = epoch
@@ -2716,6 +2845,8 @@ def handler(job):
                 "elapsedSeconds": int(max(0, now_ts - train_started_at)),
                 "etaSeconds": eta_seconds,
                 "epochSecondsEstimate": round(steady_epoch_seconds, 3) if steady_epoch_seconds is not None else None,
+                "firstEpochIts": first_epoch_its,
+                "firstEpochPerformanceClass": first_epoch_performance_class,
                 "firstEpochSeconds": round(first_epoch_seconds, 3) if first_epoch_seconds is not None else None,
                 "updatedAt": int(now_ts),
             },
@@ -2729,6 +2860,8 @@ def handler(job):
                     "totalEpoch": total_epoch,
                     "etaSeconds": eta_seconds,
                     "epochSecondsEstimate": round(steady_epoch_seconds, 3) if steady_epoch_seconds is not None else None,
+                    "firstEpochIts": first_epoch_its,
+                    "firstEpochPerformanceClass": first_epoch_performance_class,
                 }
             )
         )
@@ -2751,6 +2884,8 @@ def handler(job):
                 "elapsedSeconds": int(max(0, done_at - train_started_at)),
                 "etaSeconds": 0,
                 "epochSecondsEstimate": round(steady_epoch_seconds, 3) if steady_epoch_seconds is not None else None,
+                "firstEpochIts": first_epoch_its,
+                "firstEpochPerformanceClass": first_epoch_performance_class,
                 "firstEpochSeconds": round(first_epoch_seconds, 3) if first_epoch_seconds is not None else None,
                 "updatedAt": int(done_at),
             },
@@ -2773,6 +2908,8 @@ def handler(job):
                 "elapsedSeconds": int(max(0, failed_at - train_started_at)),
                 "etaSeconds": None,
                 "epochSecondsEstimate": round(steady_epoch_seconds, 3) if steady_epoch_seconds is not None else None,
+                "firstEpochIts": first_epoch_its,
+                "firstEpochPerformanceClass": first_epoch_performance_class,
                 "firstEpochSeconds": round(first_epoch_seconds, 3) if first_epoch_seconds is not None else None,
                 "updatedAt": int(failed_at),
                 "error": str(e)[:240],
