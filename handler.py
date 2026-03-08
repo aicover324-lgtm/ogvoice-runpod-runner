@@ -59,7 +59,7 @@ PREREQ_LOCK_STALE_SEC = int(os.environ.get("PREREQ_LOCK_STALE_SEC", "10800"))
 PREREQ_LOCK_WAIT_TIMEOUT_SEC = int(os.environ.get("PREREQ_LOCK_WAIT_TIMEOUT_SEC", "1800"))
 MUSIC_SEPARATION_DIR = Path("/app/music_separation_code")
 MUSIC_MODELS_DIR = Path("/app/music_separation_models")
-RUNNER_BUILD = "stemflow-20260224-infer-gpu-strict-v3"
+RUNNER_BUILD = "stemflow-20260308-training-pretrain-baked-v1"
 
 # Always use these advanced pretrained weights (32k).
 # Downloaded on demand and cached per worker at /content/Applio/pretrained_custom/*.pth
@@ -424,14 +424,27 @@ def get_worker_runtime_info():
     }
 
 
-def classify_first_epoch_performance(first_epoch_its, wait_to_compute_ratio, data_wait_avg_ms):
+def classify_first_epoch_performance(
+    first_epoch_its,
+    wait_to_compute_ratio,
+    data_wait_avg_ms,
+    gpu_compute_avg_ms=None,
+):
     if first_epoch_its is None:
         return "unknown"
     ratio = wait_to_compute_ratio if wait_to_compute_ratio is not None else 0.0
     wait_ms = data_wait_avg_ms if data_wait_avg_ms is not None else 0.0
-    if first_epoch_its >= 8.5 and ratio <= 0.02 and wait_ms <= 5.0:
+    compute_ms = gpu_compute_avg_ms if gpu_compute_avg_ms is not None else None
+    # First epoch includes CUDA/kernel warmup, so keep the "healthy" band slightly
+    # wider when wait metrics are clean and compute time is still in a normal range.
+    if (
+        first_epoch_its >= 7.0
+        and ratio <= 0.02
+        and wait_ms <= 5.0
+        and (compute_ms is None or compute_ms <= 170.0)
+    ):
         return "healthy"
-    if first_epoch_its >= 6.5 and ratio <= 0.05 and wait_ms <= 12.0:
+    if first_epoch_its >= 5.5 and ratio <= 0.05 and wait_ms <= 12.0:
         return "watch"
     return "degraded"
 
@@ -2608,10 +2621,11 @@ def handler(job):
 
     ensure_applio_prerequisites_ready()
 
-    # Applio's CLI limits cpu_cores to a fixed range (commonly max 64).
-    # Some RunPod machines report higher counts (e.g. 128), which would crash.
+    # Keep preprocessing/extract fan-out conservative on heterogeneous serverless
+    # nodes. Very high reported CPU counts often do not improve training startup
+    # and can amplify contention on noisy hosts.
     cpu_cores_raw = os.cpu_count() or 2
-    cpu_cores = max(1, min(int(cpu_cores_raw), 64))
+    cpu_cores = max(1, min(int(cpu_cores_raw), 32))
     if cpu_cores != cpu_cores_raw:
         print(json.dumps({"event": "cpu_cores_clamped", "raw": cpu_cores_raw, "using": cpu_cores}))
 
@@ -2796,6 +2810,7 @@ def handler(job):
                     first_epoch_its,
                     first_epoch_wait_to_compute_ratio,
                     first_epoch_data_wait_avg_ms,
+                    first_epoch_gpu_compute_avg_ms,
                 )
                 print(
                     json.dumps(

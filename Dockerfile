@@ -32,9 +32,9 @@ RUN git clone https://github.com/Eddycrack864/RVC-AI-Cover-Maker-UI --depth 1 /t
   && test -f /app/music_separation_code/inference.py \
   && rm -rf /tmp/rvc_cover
 
-# Deterministic preload of fixed inference assets.
+# Deterministic preload of fixed inference/training assets.
 # This bakes heavy models into the image so worker cold-start does not spend
-# minutes downloading predictors/embedders/separation checkpoints.
+# minutes downloading predictors/embedders/separation checkpoints/pretraineds.
 RUN python - <<'PY'
 from pathlib import Path
 from urllib.request import Request, urlopen
@@ -89,6 +89,17 @@ assets = [
         "https://huggingface.co/OrcunAICovers/stem_seperation/resolve/main/seperation_models/RVC%20embedder%20(contentvec)/Resources_embedders_contentvec_config.json?download=true",
         "/content/Applio/rvc/models/embedders/contentvec/config.json",
         200,
+    ),
+    # Applio training custom pretrained weights
+    (
+        "https://huggingface.co/OrcunAICovers/legacy_core_pretrain_v1.5/resolve/main/G_15.pth?download=true",
+        "/content/Applio/pretrained_custom/G_15.pth",
+        5_000_000,
+    ),
+    (
+        "https://huggingface.co/OrcunAICovers/legacy_core_pretrain_v1.5/resolve/main/D_15.pth?download=true",
+        "/content/Applio/pretrained_custom/D_15.pth",
+        5_000_000,
     ),
 ]
 
